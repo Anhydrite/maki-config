@@ -1,0 +1,8 @@
+[permissions]
+fs_read = true
+net = true
+net_hosts = ["opencode.ai"]
+fs_write = false
+run = false
+env = false
+agent = false
