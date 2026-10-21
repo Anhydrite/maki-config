@@ -12,8 +12,10 @@ rules, and Lua plugins. Clone it on a new machine and you get everything back.
 | `plugin.toml` | Permissions for the Lua files in this directory |
 | `lua/ocgo.lua` | `ocgo` provider: OpenCode Go + the DeepSeek V4 thinking-mode fix |
 | `lua/tps.lua` | Last-turn output speed (`tok/s`) under the chat input |
+| `lua/autocompact.lua` | Auto-compaction at 30% of the context window |
 | `plugin/ocgo.lua` | Package entry point, so the repo also installs as a Maki package |
 | `plugin/tps.lua` | Package entry point for the speed counter |
+| `plugin/autocompact.lua` | Package entry point for auto-compaction |
 | `commands/humanizer.md` | `/user:humanizer <text>` — wraps the `humanizer` skill |
 
 ## Install
@@ -59,8 +61,10 @@ maki.pack.add({
 
 `plugin/ocgo.lua` is the entry point; `lua/ocgo.lua` is the module it
 requires. Restart Maki, accept the install, then approve the permissions prompt
-(`fs_read`, `net` limited to `opencode.ai`). In this mode the settings in
-`init.lua` (such as `always_yolo`) are **not** applied — only the plugins are.
+(`fs_read`, `net` limited to `opencode.ai`, `agent` for `/compact`). In this
+mode the settings in `init.lua` (such as `always_yolo` and
+`agent.compaction_buffer`) are **not** applied — only the plugins are, and
+auto-compaction then falls back to its own defaults.
 
 Do not combine the two options: the config clone already loads `lua/ocgo.lua`,
 and installing the package on top registers the `ocgo` provider twice.
@@ -108,6 +112,48 @@ line under the chat input. There is no per-stream hook for plugins, so it
 measures `TurnStart` → `TurnEnd` wall time minus the time tools ran
 (`ToolDone.duration_ms`): generation plus network/queueing. `os.time()` has
 one-second resolution, so very short turns read rough.
+
+## Auto-compaction
+
+Maki compacts by itself only once the context reaches
+`context_window - agent.compaction_buffer`, and that buffer is capped at 50%
+of the window, so the earliest native trigger is half the context.
+`lua/autocompact.lua` ports the idea of
+[pi-auto-compact](https://github.com/capyup/pi-auto-compact) to Maki: it
+watches `maki.session.read()` and runs the built-in `/compact` command once
+the context crosses a configurable share, 30% by default.
+
+It checks at the end of every run (`TurnEnd`), when a tab becomes idle, and
+when a session is focused (startup and resume). Maki queues a `/compact`
+issued while the agent is streaming, so the run is never aborted: the
+compaction happens at the next run boundary, before the next prompt. That is
+why there is no "continue" nudge after compaction, unlike the pi extension.
+
+Only the focused session is compacted, because `maki.api.run_command` always
+targets the focused tab. Background tabs keep Maki's native trigger.
+`init.lua` also sets `agent.compaction_buffer = "50%"`, the earliest native
+trigger, as a backstop when the plugin is off or a run is headless. A plugin
+threshold above 50% is therefore superseded by that backstop.
+
+```
+/auto-compact              # status: context, threshold, guidance
+/auto-compact 35           # compact at 35% of the window (current process)
+/auto-compact tokens 200000
+/auto-compact instructions Keep the repro steps and failing test names.
+/auto-compact off          # or "on"
+/auto-compact reset        # back to the defaults from init.lua
+```
+
+Settings are in-memory, so a change made with `/auto-compact` lasts until
+Maki restarts. Persist one by editing the `setup` call in `init.lua`:
+
+```lua
+require("autocompact").setup({ percent = 30, min_regrow_percent = 10 })
+```
+
+The `keep-recent` / `keep-bookends` / `summarize-all` strategies from the pi
+extension are not ported: Maki's summarizer owns the transcript layout and
+exposes no equivalent knob.
 
 ## Commands
 

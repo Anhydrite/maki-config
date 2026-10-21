@@ -5,4 +5,5 @@ net_hosts = ["opencode.ai"]
 fs_write = false
 run = false
 env = false
-agent = false
+# /compact (run through maki.api.run_command) needs agent.
+agent = true

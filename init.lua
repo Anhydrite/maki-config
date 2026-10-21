@@ -1,5 +1,11 @@
 maki.setup({
     always_yolo = true,
+    agent = {
+        -- Native auto-compaction trigger (context_window - buffer). The buffer
+        -- is capped at 50% of the window, so this is the earliest native
+        -- trigger, kept as a backstop; lua/autocompact.lua compacts at 30%.
+        compaction_buffer = "50%",
+    },
     ui = {
         -- "auto" detects WezTerm and sends OSC 9. WezTerm turns those into
         -- "persistent" critical notifications (expire_timeout=0, urgency=2),
@@ -13,3 +19,4 @@ maki.setup({
 
 require("ocgo")
 require("tps")
+require("autocompact").setup({ percent = 30 })
