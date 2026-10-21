@@ -97,4 +97,36 @@ maki.provider.register({
     pad_reasoning_content(body, model)
     return body
   end,
+
+  -- GET /usage answers { rolling, weekly, monthly } windows, each with a
+  -- percentage and an RFC 3339 reset time. Maki's usage modal (/usage) shows
+  -- them as the 5-hour, weekly and monthly subscription quotas.
+  fetch_usage = function(ctx)
+    local body, err = ctx.get_json("/usage")
+    if err then
+      return nil, err
+    end
+    local usage = body and body.usage
+    if not usage then
+      return nil
+    end
+    local windows = {
+      { key = "rolling", label = "5-hour" },
+      { key = "weekly", label = "Weekly" },
+      { key = "monthly", label = "Monthly" },
+    }
+    local limits = {}
+    for _, window in ipairs(windows) do
+      local w = usage[window.key]
+      if w then
+        table.insert(limits, {
+          label = window.label,
+          percentage = w.percent,
+          reset_at = w.resetsAt,
+          detail = w.status and w.status ~= "ok" and ("status: " .. w.status) or nil,
+        })
+      end
+    end
+    return { plan = "OpenCode Go", limits = limits }
+  end,
 })

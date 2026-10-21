@@ -3,3 +3,4 @@ maki.setup({
 })
 
 require("ocgo")
+require("tps")

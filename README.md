@@ -11,7 +11,9 @@ rules, and Lua plugins. Clone it on a new machine and you get everything back.
 | `permissions.toml` | Bash/shell permission rules |
 | `plugin.toml` | Permissions for the Lua files in this directory |
 | `lua/ocgo.lua` | `ocgo` provider: OpenCode Go + the DeepSeek V4 thinking-mode fix |
+| `lua/tps.lua` | Last-turn output speed (`tok/s`) under the chat input |
 | `plugin/ocgo.lua` | Package entry point, so the repo also installs as a Maki package |
+| `plugin/tps.lua` | Package entry point for the speed counter |
 
 ## Install
 
@@ -50,7 +52,7 @@ repo as a package in the global `~/.config/maki/init.lua`:
 
 ```lua
 maki.pack.add({
-  { src = "https://github.com/Anhydrite/maki-config", version = "v0.1.0" },
+  { src = "https://github.com/Anhydrite/maki-config", version = "v0.2.0" },
 })
 ```
 
@@ -87,6 +89,24 @@ back to the API.
 Models: `ocgo/deepseek-v4.1-flash` (medium) and `ocgo/deepseek-v4-pro`
 (strong). The built-in `opencode-go` provider is left untouched; switch back
 whenever you want.
+
+## Usage and speed
+
+`/usage` (the Maki usage modal) shows the OpenCode Go subscription windows
+queried from `GET /zen/go/v1/usage`:
+
+- **5-hour** — the rolling window
+- **Weekly**
+- **Monthly**
+
+Each row shows the percentage used and when it resets. The modal also keeps
+Maki's own session totals and per-model breakdown.
+
+`lua/tps.lua` reports the last turn's output speed (`42.3 tok/s`) in the hint
+line under the chat input. There is no per-stream hook for plugins, so it
+measures `TurnStart` → `TurnEnd` wall time minus the time tools ran
+(`ToolDone.duration_ms`): generation plus network/queueing. `os.time()` has
+one-second resolution, so very short turns read rough.
 
 ## Adding a customization
 
