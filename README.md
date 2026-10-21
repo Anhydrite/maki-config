@@ -14,6 +14,7 @@ rules, and Lua plugins. Clone it on a new machine and you get everything back.
 | `lua/tps.lua` | Last-turn output speed (`tok/s`) under the chat input |
 | `plugin/ocgo.lua` | Package entry point, so the repo also installs as a Maki package |
 | `plugin/tps.lua` | Package entry point for the speed counter |
+| `commands/humanizer.md` | `/user:humanizer <text>` — wraps the `humanizer` skill |
 
 ## Install
 
@@ -107,6 +108,25 @@ line under the chat input. There is no per-stream hook for plugins, so it
 measures `TurnStart` → `TurnEnd` wall time minus the time tools ran
 (`ToolDone.duration_ms`): generation plus network/queueing. `os.time()` has
 one-second resolution, so very short turns read rough.
+
+## Commands
+
+`commands/humanizer.md` exposes `/user:humanizer <text>`: it loads the
+[`humanizer`](https://github.com/blader/humanizer) skill and rewrites the text
+without the usual AI tells. Custom commands are namespaced by scope in Maki —
+`/user:` for this directory, `/project:` for `.maki/commands/` — so the short
+`/humanizer` does not resolve.
+
+The skill itself is not vendored here. Install it once per machine:
+
+```bash
+mkdir -p ~/.agents/skills/humanizer
+curl -fsSL https://raw.githubusercontent.com/blader/humanizer/main/SKILL.md \
+  -o ~/.agents/skills/humanizer/SKILL.md
+```
+
+Restart Maki after adding or changing a command: commands are discovered at
+launch, not by `/reload`.
 
 ## Adding a customization
 
