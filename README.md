@@ -17,6 +17,8 @@ rules, and Lua plugins. Clone it on a new machine and you get everything back.
 | `plugin/tps.lua` | Package entry point for the speed counter |
 | `plugin/autocompact.lua` | Package entry point for auto-compaction |
 | `commands/humanizer.md` | `/user:humanizer <text>` — wraps the `humanizer` skill |
+| `skills/chrome-devtools-axi/SKILL.md` | `chrome-devtools-axi` browser skill, imported from the pi setup |
+| `commands/chrome-devtools-axi.md` | `/user:chrome-devtools-axi <tâche>` — invokes that skill |
 
 ## Install
 
@@ -173,6 +175,45 @@ curl -fsSL https://raw.githubusercontent.com/blader/humanizer/main/SKILL.md \
 
 Restart Maki after adding or changing a command: commands are discovered at
 launch, not by `/reload`.
+
+## Skills
+
+`skills/chrome-devtools-axi/SKILL.md` is a copy of the
+[`chrome-devtools-axi`](https://github.com/kunchenguid/chrome-devtools-axi)
+skill from the pi setup, so cloning this config also gives Maki the browser
+tool outside pi. The skill is a pointer: the CLI itself is invoked as
+`npx -y chrome-devtools-axi ...`, so nothing else is vendored here.
+
+Maki looks for skills in this order, and the last one found wins on a name
+clash:
+
+1. `~/.config/maki/skills/` (this repo)
+2. `~/.claude/skills/`, `~/.config/opencode/skills/`, `~/.agents/skills/`
+3. the project's `.maki/skills/`, `.claude/skills/`, `.opencode/skills/`,
+   `.agents/skills/`, walking up to the git root
+
+On a machine where the `skills` CLI already installed it, the
+`~/.agents/skills/chrome-devtools-axi` copy is the one Maki loads, because it
+comes last; this copy is the portable fallback. To refresh it after an
+upstream update:
+
+```bash
+cp ~/.agents/skills/chrome-devtools-axi/SKILL.md \
+  skills/chrome-devtools-axi/SKILL.md
+```
+
+Maki does not show skills in the UI and does not turn them into slash
+commands (pi does when `enableSkillCommands` is on). The agent sees them only
+through the `skill` tool. `commands/chrome-devtools-axi.md` is the visible
+entry point, `/user:chrome-devtools-axi <tâche>`, on the same pattern as the
+`humanizer` command: it asks the agent to load the skill first. Custom
+commands are discovered at launch, not by `/reload`, so restart Maki after
+adding or changing one.
+
+| Skill | Command |
+| --- | --- |
+| `chrome-devtools-axi` | `/user:chrome-devtools-axi <tâche>` |
+| `humanizer` | `/user:humanizer <texte>` |
 
 ## Adding a customization
 
