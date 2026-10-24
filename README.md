@@ -19,6 +19,8 @@ rules, and Lua plugins. Clone it on a new machine and you get everything back.
 | `commands/humanizer.md` | `/user:humanizer <text>` — wraps the `humanizer` skill |
 | `skills/chrome-devtools-axi/SKILL.md` | `chrome-devtools-axi` browser skill, imported from the pi setup |
 | `commands/chrome-devtools-axi.md` | `/user:chrome-devtools-axi <tâche>` — invokes that skill |
+| `skills/lavish/SKILL.md` | `lavish` skill: HTML artifacts reviewed and annotated via `npx -y lavish-axi` |
+| `commands/lavish.md` | `/user:lavish <ce que l'artefact doit montrer>` — invokes that skill |
 
 ## Install
 
