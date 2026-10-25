@@ -14,10 +14,19 @@
 --   SessionStatusChanged  a tab that just became idle
 --
 -- A /compact sent while the agent is streaming is queued by maki and runs at
--- the next run boundary. That is why there is no mid-run abort to recover
--- from and no auto-continue nudge, unlike pi-auto-compact: the run that
--- crossed the threshold finishes normally, and the compaction happens before
--- the next prompt.
+-- the next run boundary, so the run that crossed the threshold finishes
+-- normally. Left there the agent parks until the next human prompt, because
+-- the compaction lands between two turns: measured 2026-10-25, turn end at
+-- 13:50:22, compaction done at 13:50:44, next work at 14:03:11 (a prompt).
+-- So after a compaction this plugin started -- or one maki's own trigger
+-- started -- it posts a resume note with wake = true and the agent carries on
+-- with the work in flight, the way pi-auto-compact does.
+--
+-- What counts as resumable:
+--   ours     set by trigger() right before /compact
+--   native   set by the "AutoCompacting" event maki fires on its own trigger
+-- A manual /compact sets neither: the user asked for the summary, not for the
+-- work to carry on, so it stays silent.
 --
 -- Only the focused session is compacted: maki.api.run_command always targets
 -- the focused tab. Background tabs keep maki's native trigger (50% at most).
@@ -40,6 +49,18 @@ local DEFAULTS = {
   -- the threshold from triggering another one on the next turn.
   min_regrow_percent = 10,
   instructions = "Focus on preserving task context and recent work.",
+  -- Wake the session with a resume note once a compaction lands, so the agent
+  -- continues instead of parking until the next human prompt.
+  resume = true,
+  -- A second compaction this soon after a resume is one the waking turn caused
+  -- by itself; waking again would compound the cost without new work.
+  resume_min_gap_secs = 60,
+  -- Appended to the sizes of the compaction. Model-facing, so it says what to
+  -- do rather than what happened.
+  resume_text = "Reprends le travail en cours là où il s'est arrêté : le résumé "
+    .. "de compaction remplace l'historique détaillé. Ne refais pas ce qui est "
+    .. "déjà fait, ne redemande pas une confirmation déjà donnée, et si le lot "
+    .. "est terminé, donne le rapport de livraison et arrête-toi.",
   debug = false,
 }
 
@@ -52,7 +73,7 @@ for key, value in pairs(DEFAULTS) do
   configured[key] = value
 end
 
--- session id -> { pending, pending_at, after }
+-- session id -> { pending, pending_at, after, ours, native, cancelled, last_resume }
 local sessions = {}
 
 local function debug(message)
@@ -118,10 +139,14 @@ end
 local function trigger(session_id, state, size, window, source)
   state.pending = true
   state.pending_at = os.time()
+  -- From here the next CompactionDone is ours, which is what decides whether
+  -- the agent gets a resume note afterwards.
+  state.ours = true
   debug(string.format("compacting %s at %s / %s (%s)", session_id, human(size), human(window), source))
   local ok, err = maki.api.run_command(compact_command())
   if not ok then
     state.pending = false
+    state.ours = nil
     maki.log.warn("autocompact: /compact refused: " .. tostring(err))
     return
   end
@@ -132,6 +157,72 @@ local function trigger(session_id, state, size, window, source)
     human(window),
     source
   ))
+end
+
+-- The note a woken agent reads. It names the compaction that just happened so
+-- the model does not mistake the summary for a user request, then says what to
+-- do with it.
+local function resume_note(before, after)
+  local lead = "Auto-compaction terminée."
+  if before and after then
+    lead = string.format("Auto-compaction terminée (%s -> %s de contexte).", human(before), human(after))
+  end
+  return lead .. " " .. cfg.resume_text
+end
+
+local function deliver_resume(session_id, note)
+  local snapshot = snapshot_for(session_id)
+  if not snapshot then
+    return
+  end
+  local queued = (snapshot.queue and snapshot.queue.count) or 0
+  -- A run already in flight, or a prompt the user queued, will read the note
+  -- on its own: waking on top of it would buy a second turn nobody asked for.
+  -- Neither is a half-written prompt in the input: taking the floor while
+  -- somebody is typing is the one wake that feels like a bug.
+  local composing = false
+  local input = maki.ui.input()
+  if input and input.session_id == session_id and (input.text or "") ~= "" then
+    composing = true
+  end
+  local wake = snapshot.status == "idle" and queued == 0 and not composing
+  local ok, err = maki.session.notify(note, { session = session_id, wake = wake })
+  if not ok then
+    maki.log.warn("autocompact: resume refused: " .. tostring(err))
+    return
+  end
+  maki.log.info(string.format(
+    "autocompact: resume %s for %s (status %s%s)",
+    wake and "woke" or "left for the next run",
+    session_id,
+    tostring(snapshot.status),
+    queued > 0 and (", " .. queued .. " queued") or ""
+  ))
+  debug("resume note: " .. note)
+end
+
+local function resume(session_id, state, data)
+  if not cfg.resume then
+    debug("no resume: off")
+    return
+  end
+  -- Esc means the user stopped the work, not that it should carry on.
+  if state.cancelled then
+    debug("no resume: last turn was cancelled")
+    return
+  end
+  local now = os.time()
+  if state.last_resume and now - state.last_resume < cfg.resume_min_gap_secs then
+    debug("no resume: last one " .. (now - state.last_resume) .. "s ago")
+    return
+  end
+  state.last_resume = now
+  local note = resume_note(data.context_size_before, data.context_size_after)
+  -- Give the compaction a moment to land: a turn posted in the same tick would
+  -- race the history rewrite.
+  maki.defer_fn(function()
+    deliver_resume(session_id, note)
+  end, 1000)
 end
 
 local function check(session_id, snapshot, source)
@@ -187,9 +278,16 @@ end
 maki.api.create_autocmd("TurnEnd", {
   callback = function(event)
     local data = event.data or {}
-    -- The user cancelled: do not start a multi-minute summary right after Esc.
+    -- The user cancelled: do not start a multi-minute summary right after Esc,
+    -- and do not resume the work they just stopped.
     if data.reason == "cancelled" or data.reason == "dropped" then
+      if data.session_id then
+        state_for(data.session_id).cancelled = true
+      end
       return
+    end
+    if data.session_id then
+      state_for(data.session_id).cancelled = nil
     end
     local snapshot = snapshot_for(data.session_id)
     if not snapshot then
@@ -231,6 +329,16 @@ maki.api.create_autocmd("SessionStatusChanged", {
   end,
 })
 
+maki.api.create_autocmd("TurnStart", {
+  callback = function(event)
+    local data = event.data or {}
+    local state = data.session_id and sessions[data.session_id]
+    if state then
+      state.cancelled = nil
+    end
+  end,
+})
+
 maki.api.create_autocmd("CompactionDone", {
   callback = function(event)
     local data = event.data or {}
@@ -238,8 +346,13 @@ maki.api.create_autocmd("CompactionDone", {
       return
     end
     local state = state_for(data.session_id)
+    -- Ours or maki's own trigger: the agent was working and should carry on.
+    -- A manual /compact sets neither flag, so it stays silent.
+    local resumable = state.ours or state.native
     state.pending = false
     state.pending_at = nil
+    state.ours = nil
+    state.native = nil
     state.after = data.context_size_after or 0
     debug(string.format(
       "compaction done for %s: %s -> %s",
@@ -247,6 +360,9 @@ maki.api.create_autocmd("CompactionDone", {
       human(data.context_size_before or 0),
       human(data.context_size_after or 0)
     ))
+    if resumable then
+      resume(data.session_id, state, data)
+    end
   end,
 })
 
@@ -259,6 +375,7 @@ maki.api.create_autocmd("AutoCompacting", {
     local state = state_for(data.session_id)
     state.pending = true
     state.pending_at = os.time()
+    state.native = true
   end,
 })
 
@@ -276,6 +393,16 @@ maki.api.create_autocmd({ "SessionEnd", "SessionReset" }, {
 maki.defer_fn(function()
   check_session(nil, "startup")
 end, 2000)
+
+local function human_age(secs)
+  if secs < 60 then
+    return secs .. "s"
+  end
+  if secs < 3600 then
+    return math.floor(secs / 60) .. "m"
+  end
+  return math.floor(secs / 3600) .. "h"
+end
 
 local function status_text()
   local limit
@@ -302,12 +429,16 @@ local function status_text()
       if state.pending then
         lines[#lines + 1] = "Compaction pending"
       end
+      if state.last_resume then
+        lines[#lines + 1] = string.format("Last resume: %s ago", human_age(os.time() - state.last_resume))
+      end
     end
   else
     lines[#lines + 1] = "Context: unavailable"
   end
+  lines[#lines + 1] = "Resume: " .. (cfg.resume and "on" or "off")
   lines[#lines + 1] = "Guidance: " .. ((cfg.instructions and cfg.instructions ~= "") and cfg.instructions or "(none)")
-  lines[#lines + 1] = "Usage: /auto-compact [status|<percent>|tokens <n>|instructions <text>|on|off|reset]"
+  lines[#lines + 1] = "Usage: /auto-compact [status|<percent>|tokens <n>|instructions <text>|resume on|off|simulate|on|off|reset]"
   return table.concat(lines, "\n")
 end
 
@@ -361,6 +492,38 @@ maki.api.register_command({
       return
     end
 
+    if head == "resume" then
+      local mode = (args[2] or ""):lower()
+      if mode == "on" or mode == "off" then
+        cfg.resume = mode == "on"
+        maki.notify("Resume after auto-compaction " .. (cfg.resume and "on" or "off"))
+        return
+      end
+      maki.notify("usage: /auto-compact resume on|off", "warn")
+      return
+    end
+
+    -- Self-test of the resume path: fires the event a real compaction fires,
+    -- with the context sizes left untouched. Nothing is summarized.
+    if head == "simulate" then
+      local snapshot = snapshot_for(nil)
+      if not snapshot or not snapshot.id then
+        maki.notify("simulate: no focused session", "warn")
+        return
+      end
+      state_for(snapshot.id).ours = true
+      maki.api.exec_autocmds("CompactionDone", {
+        data = {
+          session_id = snapshot.id,
+          context_size_before = snapshot.context_size,
+          context_size_after = snapshot.context_size,
+          context_window = snapshot.context_window,
+        },
+      })
+      maki.notify("simulate: CompactionDone fired, resume note on its way")
+      return
+    end
+
     local percent = tonumber(head)
     if percent and percent > 0 and percent < 100 then
       cfg.percent = math.floor(percent)
@@ -370,7 +533,7 @@ maki.api.register_command({
       return
     end
 
-    maki.notify("usage: /auto-compact [status|<percent>|tokens <n>|instructions <text>|on|off|reset]", "warn")
+    maki.notify("usage: /auto-compact [status|<percent>|tokens <n>|instructions <text>|resume on|off|simulate|on|off|reset]", "warn")
   end,
 })
 
@@ -381,7 +544,7 @@ function M.setup(opts)
   for key in pairs(DEFAULTS) do
     if opts[key] ~= nil then
       local value = opts[key]
-      if key == "percent" or key == "tokens" or key == "min_regrow_percent" then
+      if key == "percent" or key == "tokens" or key == "min_regrow_percent" or key == "resume_min_gap_secs" then
         value = math.floor(tonumber(value) or 0)
       end
       cfg[key] = value

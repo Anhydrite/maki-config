@@ -12,10 +12,11 @@ rules, and Lua plugins. Clone it on a new machine and you get everything back.
 | `plugin.toml` | Permissions for the Lua files in this directory |
 | `lua/ocgo.lua` | `ocgo` provider: OpenCode Go + the DeepSeek V4 thinking-mode fix |
 | `lua/tps.lua` | Last-turn output speed (`tok/s`) under the chat input |
-| `lua/autocompact.lua` | Auto-compaction at 30% of the context window |
+| `lua/autocompact.lua` | Auto-compaction at 30% of the context window, and an automatic resume afterwards |
 | `plugin/ocgo.lua` | Package entry point, so the repo also installs as a Maki package |
 | `plugin/tps.lua` | Package entry point for the speed counter |
 | `plugin/autocompact.lua` | Package entry point for auto-compaction |
+| `tests/resume-matrix.sh` | Proof of the resume path: five isolated Maki runs, expected matrix in the header |
 | `commands/humanizer.md` | `/user:humanizer <text>` — wraps the `humanizer` skill |
 | `skills/chrome-devtools-axi/SKILL.md` | `chrome-devtools-axi` browser skill, imported from the pi setup |
 | `commands/chrome-devtools-axi.md` | `/user:chrome-devtools-axi <tâche>` — invokes that skill |
@@ -130,8 +131,26 @@ the context crosses a configurable share, 30% by default.
 It checks at the end of every run (`TurnEnd`), when a tab becomes idle, and
 when a session is focused (startup and resume). Maki queues a `/compact`
 issued while the agent is streaming, so the run is never aborted: the
-compaction happens at the next run boundary, before the next prompt. That is
-why there is no "continue" nudge after compaction, unlike the pi extension.
+compaction happens at the next run boundary, before the next prompt.
+
+That boundary is also where the agent used to stop: the compaction lands
+between two turns, so the tab sits idle until the human types again. Measured
+2026-10-25 in a real session, turn end 13:50:22, compaction done 13:50:44,
+next work 14:03:11 — a prompt. So once the compaction reports back
+(`CompactionDone`), the plugin posts a resume note with
+`maki.session.notify(..., { wake = true })` and the agent carries on with the
+work in flight, the way pi-auto-compact does.
+
+Three things keep that honest:
+
+- a manual `/compact` never resumes: the user asked for the summary, not for
+the work to carry on, so no flag is set and nothing is posted;
+- a turn that ended with Esc (`cancelled` / `dropped`) never resumes, even if
+Maki's own trigger compacted afterwards;
+- a run already in flight, a prompt the user queued, or a half-written prompt
+in the input receives the note without a wake: waking on top of it would buy
+a second turn nobody asked for. Two compactions inside
+`resume_min_gap_secs` post one note, not two.
 
 Only the focused session is compacted, because `maki.api.run_command` always
 targets the focused tab. Background tabs keep Maki's native trigger.
@@ -140,10 +159,12 @@ trigger, as a backstop when the plugin is off or a run is headless. A plugin
 threshold above 50% is therefore superseded by that backstop.
 
 ```
-/auto-compact              # status: context, threshold, guidance
+/auto-compact              # status: context, threshold, resume, guidance
 /auto-compact 35           # compact at 35% of the window (current process)
 /auto-compact tokens 200000
 /auto-compact instructions Keep the repro steps and failing test names.
+/auto-compact resume off   # or "on": wake the agent after a compaction
+/auto-compact simulate     # self-test: fire CompactionDone, no summarising
 /auto-compact off          # or "on"
 /auto-compact reset        # back to the defaults from init.lua
 ```
@@ -152,12 +173,18 @@ Settings are in-memory, so a change made with `/auto-compact` lasts until
 Maki restarts. Persist one by editing the `setup` call in `init.lua`:
 
 ```lua
-require("autocompact").setup({ percent = 30, min_regrow_percent = 10 })
+require("autocompact").setup({ percent = 30, min_regrow_percent = 10, resume = true })
 ```
 
 The `keep-recent` / `keep-bookends` / `summarize-all` strategies from the pi
 extension are not ported: Maki's summarizer owns the transcript layout and
 exposes no equivalent knob.
+
+Proof, without waiting for a real 300k-token compaction:
+
+```bash
+bash tests/resume-matrix.sh   # 5 short runs, expected matrix in the header
+```
 
 ## Commands
 

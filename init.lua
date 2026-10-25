@@ -19,4 +19,4 @@ maki.setup({
 
 require("ocgo")
 require("tps")
-require("autocompact").setup({ percent = 30 })
+require("autocompact").setup({ percent = 30, resume = true })
