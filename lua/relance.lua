@@ -19,12 +19,38 @@
 -- input bar never gets a wake on top of it.
 
 local MAX_STRIKES = 2
-local DEFAULT_MAX = 15
+-- 0 = AUCUN PLAFOND, et c'est le defaut. Demande du proprietaire, 2026-10-28 : « il faut que /relacne
+-- reste actif tant que je ne l'ai pas desactive ». Le plafond de 15 arretait la boucle sans que
+-- personne ne l'ait demande ; `/relance 20` en pose un explicitement, et `/relance` seul l'eteint.
+local DEFAULT_MAX = 0
 
 -- A state cell that begins with one of these is a finished line. Prefix
 -- matching on purpose: "fait, publié", "terminé", "livré", "soldé" all pass,
 -- and accents never enter the comparison.
 local DONE_STEMS = { "fait", "termin", "livr", "publi", "sold", "done", "ok" }
+
+-- Une ligne dont l'etat dit « en attente de decision / d'arbitrage » ne se TRAVAILLE pas : elle se
+-- POSE en question. Mesure du 2026-10-28 : cinq lignes bloquees par la meme question restee sans
+-- reponse, et la relance a redemande trois fois le meme travail, qui ne pouvait pas se faire.
+local function is_blocked(state)
+  local s = (state or ""):lower()
+  if not s:find("attente", 1, true) then
+    return false
+  end
+  return s:find("décision", 1, true) ~= nil
+    or s:find("decision", 1, true) ~= nil
+    or s:find("arbitrage", 1, true) ~= nil
+end
+
+local function bloque_count(items)
+  local n = 0
+  for _, item in ipairs(items) do
+    if item.blocked then
+      n = n + 1
+    end
+  end
+  return n
+end
 
 local CANDIDATES = {
   "suivi.md",
@@ -104,6 +130,7 @@ local function parse(text)
           state = state,
           line = lineno,
           demand = trim(cells[2] or ""),
+          blocked = is_blocked(state),
         }
       end
     elseif stripped:find("^|") then
@@ -209,6 +236,47 @@ local function stop(session_id, reason, notify)
   end
 end
 
+local function cap_label(st)
+  if st.max and st.max > 0 then
+    return tostring(st.max)
+  end
+  return "sans plafond"
+end
+
+local function tronque(texte, longueur)
+  local t = (texte or ""):gsub("%s+", " ")
+  if #t <= longueur then
+    return t
+  end
+  return t:sub(1, longueur - 1) .. "…"
+end
+
+-- LA FORME « QUESTIONS ». Elle s'emploie quand AUCUNE ligne n'est traitable : demander le travail
+-- produirait le meme constat encore une fois, et c'est exactement ce que le proprietaire a reproche
+-- le 2026-10-28 (« il faut que /relance soit plus pertinent au niveau du suivi des taches »).
+local function questions_note(st, path, unfinished, blocked)
+  local lignes = {
+    string.format(
+      "[relance %d/%s] %s : %d tâche(s) non finie(s), dont AUCUNE traitable — les %d attendent une décision du propriétaire.",
+      st.runs + 1,
+      cap_label(st),
+      rel(path),
+      #unfinished,
+      #blocked
+    ),
+    "Ces lignes ne peuvent pas avancer sans toi. Pose les questions, une par ligne, avec les options et leur coût :",
+  }
+  for i = 1, math.min(#blocked, 6) do
+    lignes[#lignes + 1] = string.format("  - %s (ligne %d) — « %s »", blocked[i].id, blocked[i].line, tronque(blocked[i].demand, 110))
+  end
+  if #blocked > 6 then
+    lignes[#lignes + 1] = string.format("  - … et %d autre(s)", #blocked - 6)
+  end
+  lignes[#lignes + 1] = "Une réponse tient en un message (« REQ-… a, REQ-… b »). La relance reste active et reprendra le travail dès qu'une ligne sera débloquée."
+  lignes[#lignes + 1] = string.format("Relance %d (%s) : seul le fichier vidé ou /relance off l'arrête.", st.runs + 1, cap_label(st))
+  return table.concat(lignes, "\n")
+end
+
 local function resume_note(st, path, total, done, unfinished)
   local ids, extra = {}, #unfinished - 6
   for i = 1, math.min(#unfinished, 6) do
@@ -220,7 +288,7 @@ local function resume_note(st, path, total, done, unfinished)
   end
 
   return string.format(
-    "[relance %d/%d] %s porte encore %d tâche(s) non finie(s) sur %d : %s. "
+    "[relance %d/%s] %s porte encore %d tâche(s) non finie(s) sur %d : %s. "
       .. "Prends la PREMIÈRE de ces lignes, traite-la entièrement (code, test rouge→vert, doc, preuve), "
       .. "puis mets sa ligne à jour dans le même geste. "
       .. "Une seule tâche par relance. "
@@ -229,7 +297,7 @@ local function resume_note(st, path, total, done, unfinished)
       .. "Si la tâche exige une décision du propriétaire ou une action destructive, laisse-la en attente "
       .. "avec la raison écrite et prends la suivante.",
     st.runs + 1,
-    st.max,
+    cap_label(st),
     rel(path),
     #unfinished,
     total,
@@ -254,7 +322,7 @@ local function step(session_id, kick, reason_from_turn)
     end
   end
 
-  if st.runs >= st.max then
+  if st.max and st.max > 0 and st.runs >= st.max then
     return stop(session_id, string.format("plafond de %d relances atteint", st.max), true)
   end
 
@@ -276,8 +344,20 @@ local function step(session_id, kick, reason_from_turn)
     return stop(session_id, string.format("terminé, %d/%d lignes finies dans %s", done, total, rel(path)), true)
   end
 
+  -- Ce qui est TRAITABLE, et ce qui attend une decision. Un tampon dont toutes les lignes sont
+  -- bloquees ne peut pas progresser : le compter comme « sans progres » arreterait la boucle apres
+  -- deux tours, alors que la demande est qu'elle reste active jusqu'a extinction explicite.
+  local traitable, blocked = {}, {}
+  for _, item in ipairs(unfinished) do
+    if item.blocked then
+      blocked[#blocked + 1] = item
+    else
+      traitable[#traitable + 1] = item
+    end
+  end
+
   -- Progress check, skipped on the very first run: arming is not a relaunch.
-  if st.last_sig and not kick then
+  if st.last_sig and not kick and #traitable > 0 then
     if st.last_sig == sig then
       st.strikes = st.strikes + 1
       log.warn(string.format(
@@ -309,6 +389,26 @@ local function step(session_id, kick, reason_from_turn)
     return
   end
 
+  if #traitable == 0 then
+    -- Une seule question par etat du fichier : la reposer a chaque tour serait le bavardage que la
+    -- demande du 2026-10-28 a reproche. La boucle reste ARMEE (rien ne l'arrete), elle attend.
+    if st.last_sig == sig then
+      debug("relance: questions deja posees, tampon inchange, attente de la reponse")
+      return
+    end
+    local question = questions_note(st, path, unfinished, blocked)
+    st.runs = st.runs + 1
+    st.last_sig = sig
+    st.path = path
+    local envoye, erreur = maki.session.prompt(question, { session = session_id })
+    if not envoye then
+      st.runs = st.runs - 1
+      return stop(session_id, "prompt refusé : " .. tostring(erreur), true)
+    end
+    log.info(string.format("relance: questions posees pour %s (%d bloquees)", session_id, #blocked))
+    return
+  end
+
   local text_note = resume_note(st, path, total, done, unfinished)
 
   st.runs = st.runs + 1
@@ -322,8 +422,8 @@ local function step(session_id, kick, reason_from_turn)
   end
 
   log.info(string.format(
-    "relance: run %d/%d for %s (%d unfinished, %d/%d done) %s",
-    st.runs, st.max, session_id, #unfinished, done, total, sent
+    "relance: run %d/%s for %s (%d unfinished, %d/%d done) %s",
+    st.runs, cap_label(st), session_id, #unfinished, done, total, sent
   ))
 end
 
@@ -340,8 +440,8 @@ local function status_line(session_id)
   end
   local total, done, unfinished = parse(text)
   return string.format(
-    "Relance : active sur %s — %d non finie(s) / %d, %d/%d relances, %d strike(s).",
-    rel(path), #unfinished, total, st.runs, st.max, st.strikes
+    "Relance : active sur %s — %d non finie(s) / %d (dont %d en attente de décision), %d relance(s) (%s), %d strike(s).",
+    rel(path), #unfinished, total, bloque_count(unfinished), st.runs, cap_label(st), st.strikes
   )
 end
 
@@ -355,7 +455,7 @@ end
 
 maki.api.register_command({
   name = "/relance",
-  description = "Auto-relance l'agent tant que suivi.md garde des tâches non finies (/relance off, /relance 20, /relance <chemin>)",
+  description = "Auto-relance l'agent tant que suivi.md garde des tâches non finies, sans plafond par défaut (/relance off, /relance 20, /relance <chemin>)",
   nargs = "*",
   handler = function(opts)
     local id = current_session()
@@ -418,8 +518,8 @@ maki.api.register_command({
     end
     local total, done, unfinished = parse(text)
     maki.ui.flash(string.format(
-      "Relance armée : %s, %d non finie(s) / %d, plafond %d.",
-      rel(path), #unfinished, total, st.max
+      "Relance armée : %s, %d non finie(s) / %d (dont %d en attente de décision), plafond %s.",
+      rel(path), #unfinished, total, bloque_count(unfinished), cap_label(st)
     ))
     log.info(string.format("relance: armed for %s on %s (%d/%d done)", id, path, done, total))
 
