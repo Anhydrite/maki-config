@@ -293,7 +293,6 @@ local function resume_note(st, path, total, done, unfinished)
       .. "puis mets sa ligne à jour dans le même geste. "
       .. "Une seule tâche par relance. "
       .. "Respecte l'AGENTS.md du projet (boucle T0/T1, pas de suite complète hors commit). "
-      .. "Ne commite, ne pousse et ne déploie pas. "
       .. "Si la tâche exige une décision du propriétaire ou une action destructive, laisse-la en attente "
       .. "avec la raison écrite et prends la suivante.",
     st.runs + 1,
