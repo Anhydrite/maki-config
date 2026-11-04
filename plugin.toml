@@ -2,7 +2,11 @@
 fs_read = true
 net = true
 net_hosts = ["opencode.ai"]
-fs_write = false
+# fs_write : la relance persiste son armement dans maki.env.state_dir()/relance/state.json,
+# pour survivre a /reload et a un redemarrage de maki (mesure du 2026-11-04 : la boucle
+# s'eteignait en silence alors que le fichier de suivi gardait du travail). Aucun plugin
+# d'ici n'ecrit ailleurs que ce fichier d'etat.
+fs_write = true
 run = false
 env = false
 # /compact (run through maki.api.run_command) needs agent.

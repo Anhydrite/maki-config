@@ -12,11 +12,24 @@
 --
 -- Guards, in the order they stop the loop:
 --   1. no unfinished task left                      -> done
---   2. turn cancelled (Esc), or ended in an error   -> stopped
+--   2. turn cancelled (Esc), or dropped             -> stopped
 --   3. two relaunches without the ledger moving     -> stopped, and named
 --   4. the iteration cap                            -> stopped
+-- A turn closed by ANY OTHER reason (compaction, end_turn, max_turns) does not
+-- stop the loop: measured 2026-11-04, the loop went silent right after an
+-- auto-compaction while the file still held work.
 -- The user keeps the floor: a queued prompt, a running turn, or text in the
 -- input bar never gets a wake on top of it.
+--
+-- DURABILITE — MESURE DU 2026-11-04. Le proprietaire a constate que la session
+-- s'arretait alors que `docs/design/SUIVI.md` gardait du travail, et la cause
+-- n'etait pas la compaction elle-meme : l'armement vivait UNIQUEMENT dans la
+-- table `sessions` de ce module. Un `/reload` (ou un redemarrage de maki) la
+-- vide, et rien ne le dit : la boucle s'eteint en silence. L'armement est donc
+-- ECRIT SUR DISQUE (`maki.env.state_dir()/relance/state.json`) et RESTAURE au
+-- chargement, puis relance de lui-meme la session RESTEE ARMEE. Une
+-- autocompaction remet aussi les strikes a zero : ses tours de relecture ne
+-- comptent plus comme « sans progres », puisque le fichier n'a pas bouge.
 
 local MAX_STRIKES = 2
 -- 0 = AUCUN PLAFOND, et c'est le defaut. Demande du proprietaire, 2026-10-28 : « il faut que /relacne
@@ -32,14 +45,47 @@ local DONE_STEMS = { "fait", "termin", "livr", "publi", "sold", "done", "ok" }
 -- Une ligne dont l'etat dit « en attente de decision / d'arbitrage » ne se TRAVAILLE pas : elle se
 -- POSE en question. Mesure du 2026-10-28 : cinq lignes bloquees par la meme question restee sans
 -- reponse, et la relance a redemande trois fois le meme travail, qui ne pouvait pas se faire.
+--
+-- MESURE DU 2026-10-30 : CE DETECTEUR NE CONNAISSAIT QUE LA DECISION, ET IL A FAIT 25 RELANCES INUTILES.
+-- Les huit lignes restantes du projet AnhyWhere disaient « **EN ATTENTE — PUBLICATION** » ou
+-- « **EN ATTENTE D'UN ACTE DU PROPRIÉTAIRE** ». Aucune ne contenait « décision » : toutes passaient
+-- donc pour TRAVAILLABLES, et la boucle a redemandé vingt-cinq fois « prends la PREMIÈRE de ces
+-- lignes, traite-la entièrement » pour un travail qui n'existait pas — le code était livré, il ne
+-- manquait que des actes d'exploitation (publier, rallumer le WAF, copier des gabarits, ré-adhérer
+-- les nœuds) que l'agent ne peut pas faire.
+--
+-- UN ACTE BLOQUE COMME UNE DECISION. C'est la regle qui manquait : la relance doit POSER la question
+-- au propriétaire dès que la ligne attend de lui quelque chose — un arbitrage ou un geste.
+local ACT_STEMS = { "publication", "proprietaire", "propriétaire", "acte" }
+
 local function is_blocked(state)
   local s = (state or ""):lower()
+
+  -- 1. UNE DECISION BLOQUE, MEME SANS LE MOT « ATTENTE ». Mesure du 2026-10-30 :
+  --    `**À FAIRE — décision de fonctionnalité**` n'etait pas vue comme bloquee, parce que le
+  --    detecteur exigeait d'abord « attente ». La relance redemandait donc de travailler une ligne
+  --    dont l'objet meme est de trancher.
+  -- Une decision DEJA RENDUE n'est plus un blocage : elle devient du travail. Mesure du 2026-10-30,
+  -- apres la reponse du proprietaire (`REQ-20261030-09` : « décision rendue (b) : ignorer le
+  -- parametre ») — sans cette exception, la relance aurait pose une question deja repondue.
+  local rendue = s:find("décision rendue", 1, true) or s:find("decision rendue", 1, true)
+    or s:find("décision prise", 1, true) or s:find("decision prise", 1, true)
+  if not rendue
+    and (s:find("décision", 1, true) or s:find("decision", 1, true) or s:find("arbitrage", 1, true)) then
+    return true
+  end
+
+  -- 2. UN ACTE D'EXPLOITATION BLOQUE COMME UNE DECISION, mais seulement sous « attente » — sinon le
+  --    mot « acte » d'une demande ordinaire ferait passer une ligne travaillable pour bloquee.
   if not s:find("attente", 1, true) then
     return false
   end
-  return s:find("décision", 1, true) ~= nil
-    or s:find("decision", 1, true) ~= nil
-    or s:find("arbitrage", 1, true) ~= nil
+  for _, mot in ipairs(ACT_STEMS) do
+    if s:find(mot, 1, true) then
+      return true
+    end
+  end
+  return false
 end
 
 local function bloque_count(items)
@@ -69,6 +115,75 @@ local sessions = {}
 
 local function debug(msg)
   log.debug("relance: " .. msg)
+end
+
+-- ARMEMENT PERSISTANT : voir DURABILITE en tete de fichier. Un seul fichier par
+-- processus maki, hors du projet (maki.env.state_dir()), donc il ne pollue aucun
+-- arbre et il survit a `/reload` comme a un redemarrage.
+local STATE_VERSION = 1
+local STATE_SUBDIR = "relance"
+
+local function state_file()
+  local dir = maki.env.state_dir()
+  if not dir then
+    return nil
+  end
+  return maki.fs.joinpath(dir, STATE_SUBDIR, "state.json")
+end
+
+local function read_state_file()
+  local path = state_file()
+  if not path then
+    return {}
+  end
+  local text = maki.fs.read(path)
+  if not text or text == "" then
+    return {}
+  end
+  local ok, decoded = pcall(maki.json.decode, text)
+  if not ok or type(decoded) ~= "table" or type(decoded.sessions) ~= "table" then
+    return {}
+  end
+  local out = {}
+  for id, saved in pairs(decoded.sessions) do
+    if type(saved) == "table" and saved.armed then
+      out[id] = saved
+    end
+  end
+  return out
+end
+
+local function write_state_file()
+  local path = state_file()
+  if not path then
+    return
+  end
+  local saved = {}
+  for id, st in pairs(sessions) do
+    if st.armed then
+      saved[id] = { armed = true, max = st.max or 0, path = st.path, runs = st.runs or 0 }
+    end
+  end
+  local encoded = maki.json.encode({ version = STATE_VERSION, sessions = saved })
+  maki.fs.mkdir(maki.fs.dirname(path), { parents = true })
+  local ok, err = maki.fs.atomic_write(path, encoded)
+  if not ok then
+    debug("etat non ecrit : " .. tostring(err))
+  end
+end
+
+-- LU A LA DEMANDE, JAMAIS AU CHARGEMENT : `maki.fs.read` est asynchrone, et un
+-- appel au niveau du module casse `require("relance")` (« attempt to yield
+-- across metamethod/C-call boundary », mesure par `maki index` le 2026-11-04).
+-- Un `/reload` retrouve quand meme ce qu'il vient de perdre : la lecture se
+-- fait au premier evenement, qui est aussi le premier besoin.
+local persisted = nil
+
+local function persisted_state()
+  if not persisted then
+    persisted = read_state_file()
+  end
+  return persisted
 end
 
 local function is_done(state)
@@ -169,6 +284,21 @@ local function signature(text, total, done)
 end
 
 local function state_for(session_id)
+  -- Un id absent n'est pas une session : un etat JETABLE, jamais range. Sans ce
+  -- garde, `sessions[nil]` leve « table index is nil » et emporte le callback
+  -- appelant (mesure par `tests/relance-survie.sh` le 2026-11-04 : un run `-p`
+  -- n'a pas de session courante).
+  if not session_id then
+    return {
+      armed = false,
+      runs = 0,
+      strikes = 0,
+      last_sig = nil,
+      path = nil,
+      max = DEFAULT_MAX,
+      restored = false,
+    }
+  end
   local st = sessions[session_id]
   if not st then
     st = {
@@ -178,7 +308,20 @@ local function state_for(session_id)
       last_sig = nil,
       path = nil,
       max = DEFAULT_MAX,
+      restored = false,
     }
+    -- Un armement ecrit avant un `/reload` ou un redemarrage reprend ici : sans
+    -- cette reprise, la boucle s'eteint en silence (mesure du 2026-11-04).
+    local saved = persisted_state()[session_id]
+    if saved then
+      st.armed = true
+      st.path = saved.path
+      if type(saved.max) == "number" then
+        st.max = saved.max
+      end
+      st.restored = true
+      log.info("relance: armement restaure pour " .. session_id .. " (" .. tostring(state_file()) .. ")")
+    end
     sessions[session_id] = st
   end
   return st
@@ -230,6 +373,9 @@ local function stop(session_id, reason, notify)
     st.armed = false
     st.last_sig = nil
   end
+  -- L'extinction doit survivre au redemarrage autant que l'armement : sinon la
+  -- relance se rallumerait seule au prochain `/reload`, contre la demande.
+  write_state_file()
   log.info("relance: stopped for " .. session_id .. ": " .. reason)
   if notify then
     maki.ui.flash("Relance : " .. reason)
@@ -257,14 +403,14 @@ end
 local function questions_note(st, path, unfinished, blocked)
   local lignes = {
     string.format(
-      "[relance %d/%s] %s : %d tâche(s) non finie(s), dont AUCUNE traitable — les %d attendent une décision du propriétaire.",
+      "[relance %d/%s] %s : %d tâche(s) non finie(s), dont AUCUNE traitable — les %d attendent une DÉCISION ou un ACTE du propriétaire.",
       st.runs + 1,
       cap_label(st),
       rel(path),
       #unfinished,
       #blocked
     ),
-    "Ces lignes ne peuvent pas avancer sans toi. Pose les questions, une par ligne, avec les options et leur coût :",
+    "Ces lignes ne peuvent pas avancer sans toi : le code est livré, il manque un arbitrage ou un geste (publier, rallumer le WAF, copier des gabarits, ré-adhérer un nœud). Pose les questions, une par ligne, avec les options et leur coût :",
   }
   for i = 1, math.min(#blocked, 6) do
     lignes[#lignes + 1] = string.format("  - %s (ligne %d) — « %s »", blocked[i].id, blocked[i].line, tronque(blocked[i].demand, 110))
@@ -273,11 +419,15 @@ local function questions_note(st, path, unfinished, blocked)
     lignes[#lignes + 1] = string.format("  - … et %d autre(s)", #blocked - 6)
   end
   lignes[#lignes + 1] = "Une réponse tient en un message (« REQ-… a, REQ-… b »). La relance reste active et reprendra le travail dès qu'une ligne sera débloquée."
-  lignes[#lignes + 1] = string.format("Relance %d (%s) : seul le fichier vidé ou /relance off l'arrête.", st.runs + 1, cap_label(st))
+  lignes[#lignes + 1] = string.format(
+    "Relance %d (%s) : seul le fichier vidé ou /relance off l'arrête ; elle survit à la compaction et à un /reload (armement écrit sur disque).",
+    st.runs + 1,
+    cap_label(st)
+  )
   return table.concat(lignes, "\n")
 end
 
-local function resume_note(st, path, total, done, unfinished)
+local function resume_note(st, path, total, done, unfinished, traitable)
   local ids, extra = {}, #unfinished - 6
   for i = 1, math.min(#unfinished, 6) do
     ids[#ids + 1] = unfinished[i].id
@@ -287,11 +437,28 @@ local function resume_note(st, path, total, done, unfinished)
     list = list .. string.format(" (+%d autres)", extra)
   end
 
+  -- La ligne demandee est nommee, avec sa ligne de fichier et son etat : apres
+  -- une compaction le modele n'a plus l'historique, et « la premiere de ces
+  -- lignes » lui demandait de reconstruire ce que le resume ne portait pas.
+  local cible = ""
+  local first = traitable and traitable[1]
+  if first then
+    local demande = tronque(first.demand, 140)
+    if demande ~= "" then
+      cible = string.format("Prochaine ligne : %s (ligne %d) — « %s ». ", first.id, first.line, demande)
+    else
+      cible = string.format("Prochaine ligne : %s (ligne %d). ", first.id, first.line)
+    end
+  end
+
   return string.format(
     "[relance %d/%s] %s porte encore %d tâche(s) non finie(s) sur %d : %s. "
-      .. "Prends la PREMIÈRE de ces lignes, traite-la entièrement (code, test rouge→vert, doc, preuve), "
-      .. "puis mets sa ligne à jour dans le même geste. "
-      .. "Une seule tâche par relance. "
+      .. cible
+      .. "Traite-la entièrement (code, test rouge→vert, doc, preuve), puis mets SA ligne à jour dans le même geste : "
+      .. "un tour qui ne touche pas le fichier compte comme un tour sans progrès, et deux d'affilée arrêtent la relance. "
+      .. "Le FICHIER est le juge, jamais le résumé : si tu viens d'être compacté, relis la ligne et son état avant de conclure "
+      .. "qu'elle est finie, et ne te fie pas au récit du résumé pour dire que le lot est terminé. "
+      .. "Une seule tâche par relance : tu n'as pas à décider que tout est fini, c'est la relance qui te rend la main. "
       .. "Respecte l'AGENTS.md du projet (boucle T0/T1, pas de suite complète hors commit). "
       .. "Si la tâche exige une décision du propriétaire ou une action destructive, laisse-la en attente "
       .. "avec la raison écrite et prends la suivante.",
@@ -313,11 +480,16 @@ local function step(session_id, kick, reason_from_turn)
   end
 
   if reason_from_turn then
-    if reason_from_turn == "cancelled" then
-      return stop(session_id, "tour interrompu (Esc)", true)
+    if reason_from_turn == "cancelled" or reason_from_turn == "dropped" then
+      return stop(session_id, "tour interrompu (" .. reason_from_turn .. ")", true)
     end
     if reason_from_turn ~= "finished" and reason_from_turn ~= "max_turns" then
-      return stop(session_id, "tour clos par " .. reason_from_turn, true)
+      -- MESURE DU 2026-11-04 : une autocompaction ferme le tour avec un motif qui
+      -- n'est ni `finished` ni `max_turns`. S'arreter la rendait la boucle MUETTE
+      -- juste apres la compaction, alors que le fichier gardait du travail (le
+      -- proprietaire l'a constate). Un motif inconnu ne stoppe donc plus : on le
+      -- note, et on continue — c'est le fichier qui decide, pas le motif du tour.
+      debug("tour clos par " .. tostring(reason_from_turn) .. " : la relance continue")
     end
   end
 
@@ -408,7 +580,7 @@ local function step(session_id, kick, reason_from_turn)
     return
   end
 
-  local text_note = resume_note(st, path, total, done, unfinished)
+  local text_note = resume_note(st, path, total, done, unfinished, traitable)
 
   st.runs = st.runs + 1
   st.last_sig = sig
@@ -438,9 +610,11 @@ local function status_line(session_id)
     return "Relance : active, mais aucun suivi.md trouvé."
   end
   local total, done, unfinished = parse(text)
+  local fichier = state_file()
   return string.format(
-    "Relance : active sur %s — %d non finie(s) / %d (dont %d en attente de décision), %d relance(s) (%s), %d strike(s).",
-    rel(path), #unfinished, total, bloque_count(unfinished), st.runs, cap_label(st), st.strikes
+    "Relance : active sur %s — %d non finie(s) / %d (dont %d en attente de décision), %d relance(s) (%s), %d strike(s). Armement écrit dans %s (survit à la compaction et au rechargement).",
+    rel(path), #unfinished, total, bloque_count(unfinished), st.runs, cap_label(st), st.strikes,
+    tostring(fichier)
   )
 end
 
@@ -454,7 +628,7 @@ end
 
 maki.api.register_command({
   name = "/relance",
-  description = "Auto-relance l'agent tant que suivi.md garde des tâches non finies, sans plafond par défaut (/relance off, /relance 20, /relance <chemin>)",
+  description = "Auto-relance l'agent tant que suivi.md garde des tâches non finies, sans plafond par défaut ; l'armement est écrit sur disque, donc il survit à /reload, à un redémarrage et à une autocompaction (/relance off, /relance 20, /relance <chemin>)",
   nargs = "*",
   handler = function(opts)
     local id = current_session()
@@ -506,6 +680,10 @@ maki.api.register_command({
     st.runs = 0
     st.strikes = 0
     st.last_sig = nil
+    st.restored = false
+    -- Ecrit AVANT le premier tour : si maki est recharge ou redemarre dans la
+    -- seconde, l'armement ne depend pas d'un tour qui n'a pas encore eu lieu.
+    write_state_file()
 
     local snapshot = maki.session.read({ session = id })
     local cwd = (snapshot and snapshot.cwd) or maki.uv.cwd()
@@ -550,11 +728,87 @@ maki.api.create_autocmd("SessionEnd", {
   callback = function(ev)
     local id = ev.data and ev.data.session_id
     if id then
+      -- La table seulement : le FICHIER garde l'armement. Une fin de session
+      -- n'est pas une extinction demandee, et un evenement de trop ne doit pas
+      -- eteindre la boucle au prochain chargement.
       sessions[id] = nil
     end
   end,
 })
 
+-- COMPACTION : c'est le moment ou le modele perd l'historique detaille. Deux
+-- choses ici, et pas une de plus.
+--  1. Les strikes sont remis a zero : les tours de relecture qui suivent une
+--     compaction ne touchent pas le fichier, et comptaient comme « sans
+--     progres » — deux d'affilee eteignaient la relance juste apres une
+--     autocompaction (mesure du 2026-11-04).
+--  2. Un tour est relance si personne ne l'a fait. Le plugin autocompact poste
+--     deja sa note de reprise ; le garde-fou « travail en cours / prompt en
+--     file » de `step` empeche alors le doublon. Si `resume` est desactive la
+--     bas, c'est cette voie qui reprend le travail.
+maki.api.create_autocmd("CompactionDone", {
+  callback = function(ev)
+    local id = ev.data and ev.data.session_id
+    if not id then
+      return
+    end
+    local st = sessions[id]
+    if st then
+      st.strikes = 0
+      st.last_sig = nil
+    end
+    log.info("relance: compaction terminee pour " .. id .. " (strikes remis a zero)")
+    maki.defer_fn(function()
+      local s2 = sessions[id]
+      if s2 and s2.armed then
+        step(id, false, nil)
+      end
+    end, 3000)
+  end,
+})
+
+-- REPRISE APRES CHARGEMENT : `/reload` reconstruit ce module, et un redemarrage
+-- de maki repart d'une table vide. Sans cette reprise, la boucle s'eteignait en
+-- silence alors que le fichier gardait du travail — c'est exactement ce que le
+-- proprietaire a constate le 2026-11-04.
+local function reprendre_si_restaure(id)
+  if not id then
+    return
+  end
+  local st = state_for(id)
+  if st.armed and st.restored then
+    st.restored = false
+    maki.ui.flash("Relance : armement restauré du disque, la boucle reprend.")
+    maki.defer_fn(function()
+      step(id, false, nil)
+    end, 500)
+  end
+end
+
+maki.api.create_autocmd("SessionFocusChanged", {
+  callback = function(ev)
+    reprendre_si_restaure(ev.data and ev.data.session_id)
+  end,
+})
+
+maki.defer_fn(function()
+  reprendre_si_restaure(maki.session.current())
+end, 2500)
+
 
 -- Kept for the day a spec runner exists: the parser is pure.
-return { parse = parse, is_done = is_done }
+-- `_test` est la surface de sonde de `tests/relance-survie.sh` : elle n'ouvre
+-- rien que le plugin ne fasse deja (ecrire/relire l'armement, l'arreter), et
+-- elle permet de prouver la durabilite sans attendre un vrai `/reload`.
+return {
+  parse = parse,
+  is_done = is_done,
+  _test = {
+    state_for = state_for,
+    state_file = state_file,
+    read_state = read_state_file,
+    write_state = write_state_file,
+    stop = stop,
+    sessions = sessions,
+  },
+}
