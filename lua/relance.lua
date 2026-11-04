@@ -628,7 +628,7 @@ end
 
 maki.api.register_command({
   name = "/relance",
-  description = "Auto-relance l'agent tant que suivi.md garde des tâches non finies, sans plafond par défaut ; l'armement est écrit sur disque, donc il survit à /reload, à un redémarrage et à une autocompaction (/relance off, /relance 20, /relance <chemin>)",
+  description = "Auto-relance l'agent tant que suivi.md garde des tâches non finies, sans plafond par défaut ; l'armement est écrit sur disque, donc il survit à /reload, à un redémarrage et à une autocompaction. /relance arme (jamais n'éteint) ; /relance off arrête ; /relance 20 pose un plafond ; /relance <chemin> choisit le fichier.",
   nargs = "*",
   handler = function(opts)
     local id = current_session()
@@ -653,14 +653,17 @@ maki.api.register_command({
       return
     end
 
-    -- Bare /relance toggles: a second one is the natural way to say stop.
+    -- MESURE DU 2026-11-04 : le binaire « /relance » NU servait a la fois a
+    -- armer et a eteindre, et la trace de la session portait « stopped … arrêt
+    -- demandé » alors que le proprietaire croyait l'avoir relancee. Un geste qui
+    -- veut dire deux choses est un piege : nu, il ARME (ou confirme qu'elle est
+    -- deja armee), et seule une extinction EXPLICITE arrete.
     if lower == "on" or lower == "start" or lower == "go" then
-      st.armed = false
       arg = ""
     end
 
     if arg == "" and st.armed then
-      stop(id, "arrêt demandé", true)
+      maki.ui.flash("Relance : déjà active. Pour l'arrêter : /relance off. " .. status_line(id))
       return
     end
 
