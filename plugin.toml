@@ -10,5 +10,9 @@ net_hosts = ["opencode.ai"]
 fs_write = true
 run = true
 env = false
+# The bash input layer in lua/handoff.lua reads the model's command and can
+# refuse it, which is a layer over a tool that declares `run`.
+session_read = true
+session_write = true
 # /compact (run through maki.api.run_command) needs agent.
 agent = true

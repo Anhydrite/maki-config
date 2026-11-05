@@ -14,10 +14,12 @@ rules, and Lua plugins. Clone it on a new machine and you get everything back.
 | `lua/tps.lua` | Last-turn output speed (`tok/s`) under the chat input |
 | `lua/autocompact.lua` | Auto-compaction at 30% of the context window, and an automatic resume afterwards |
 | `lua/jobs.lua` | Managed background jobs (`bg_run`, `bg_status`, `bg_logs`, `bg_wait`, `bg_kill`) and `/jobs` |
+| `lua/handoff.lua` | `/handoff`: one feature at a time, targeted tests only, human validation |
 | `plugin/ocgo.lua` | Package entry point, so the repo also installs as a Maki package |
 | `plugin/tps.lua` | Package entry point for the speed counter |
 | `plugin/autocompact.lua` | Package entry point for auto-compaction |
 | `plugin/jobs.lua` | Package entry point for background jobs |
+| `plugin/handoff.lua` | Package entry point for handoff mode |
 | `tests/resume-matrix.sh` | Proof of the resume path: five isolated Maki runs, expected matrix in the header |
 | `commands/humanizer.md` | `/user:humanizer <text>` — wraps the `humanizer` skill |
 | `skills/chrome-devtools-axi/SKILL.md` | `chrome-devtools-axi` browser skill, imported from the pi setup |
@@ -227,6 +229,51 @@ declares `permission_scopes = "command"`, so it has its own `[bg_run]` rules in
 `permissions.toml`; it does **not** inherit `[bash]` rules. With
 `always_yolo = true` (the default here) no prompt is shown, so treat `bg_run`
 as equivalent to `bash` when deciding what this config may run.
+
+## Handoff mode
+
+`/handoff` adds a third way of working next to build and plan (Maki 0.7.0 has
+no native mode slot, so the plugin emulates it; it does not appear in the Tab
+cycle). The point is one feature, one request, and a validation handed back to
+the human instead of the agent claiming the suite is green.
+
+```text
+/handoff                 # toggle
+/handoff on              # arm
+/handoff off             # disarm, clears a pending unlock
+/handoff status          # current state
+/handoff allow-tests     # allow ONE blocked test command
+/handoff check <cmd>     # show the classifier verdict, runs nothing
+```
+
+While it is on, a system-prompt block tells the agent to skip planning and full
+CI, change only what was asked, and run only the test that change touches
+(one file, a `::nodeid`, or `-k` on a named file). Self-validation is read-only
+plus lint/format, and the turn must end with an "À valider" block listing what
+was and was not run.
+
+A bash input layer enforces the test rule. It blocks whole-suite and
+whole-project commands: `pytest` with no file or node id, bare `make`,
+`make test`, `make all`, `make doc`, `make docker-ci`, `npm test`, `cargo test`,
+`go test`, `tox`, `ctest`, and the other runners listed in the classifier.
+`make format`, `make lint`, `ruff`, and a targeted test file or node id pass.
+A blocked command returns a short reason to the model, which proposes the
+targeted test instead. `/handoff check <cmd>` shows the same verdict without
+running anything, which is the quick way to debug a false positive.
+
+When a broader run is genuinely needed, `/handoff allow-tests` unlocks exactly
+one blocked command; the next one is blocked again. The status line shows
+`handoff tests débloqués (1)` while the unlock is pending.
+
+The `on` flag persists in `~/.local/state/maki/handoff.json`, so `/reload` and
+a restart keep the mode armed; only `/handoff off` clears it. The one-command
+unlock stays in memory and is lost on reload.
+
+Limits: the hook covers `bash` only. `code_execution`, MCP shells, and other
+tools that start processes (like the `bg_run` job runner) are not intercepted
+(the prompt forbids them, but there is no hard guarantee), and a line typed
+with `!` in the input bypasses it on purpose, since the human may always run
+what they want.
 
 ## Commands
 
