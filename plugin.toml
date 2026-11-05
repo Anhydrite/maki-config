@@ -6,8 +6,9 @@ net_hosts = ["opencode.ai"]
 # pour survivre a /reload et a un redemarrage de maki (mesure du 2026-11-04 : la boucle
 # s'eteignait en silence alors que le fichier de suivi gardait du travail). Aucun plugin
 # d'ici n'ecrit ailleurs que ce fichier d'etat.
+# lua/jobs.lua writes logs and index.json, and starts background processes.
 fs_write = true
-run = false
+run = true
 env = false
 # /compact (run through maki.api.run_command) needs agent.
 agent = true

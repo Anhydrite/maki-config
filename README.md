@@ -13,9 +13,11 @@ rules, and Lua plugins. Clone it on a new machine and you get everything back.
 | `lua/ocgo.lua` | `ocgo` provider: OpenCode Go + the DeepSeek V4 thinking-mode fix |
 | `lua/tps.lua` | Last-turn output speed (`tok/s`) under the chat input |
 | `lua/autocompact.lua` | Auto-compaction at 30% of the context window, and an automatic resume afterwards |
+| `lua/jobs.lua` | Managed background jobs (`bg_run`, `bg_status`, `bg_logs`, `bg_wait`, `bg_kill`) and `/jobs` |
 | `plugin/ocgo.lua` | Package entry point, so the repo also installs as a Maki package |
 | `plugin/tps.lua` | Package entry point for the speed counter |
 | `plugin/autocompact.lua` | Package entry point for auto-compaction |
+| `plugin/jobs.lua` | Package entry point for background jobs |
 | `tests/resume-matrix.sh` | Proof of the resume path: five isolated Maki runs, expected matrix in the header |
 | `commands/humanizer.md` | `/user:humanizer <text>` — wraps the `humanizer` skill |
 | `skills/chrome-devtools-axi/SKILL.md` | `chrome-devtools-axi` browser skill, imported from the pi setup |
@@ -185,6 +187,46 @@ Proof, without waiting for a real 300k-token compaction:
 ```bash
 bash tests/resume-matrix.sh   # 5 short runs, expected matrix in the header
 ```
+
+## Background jobs
+
+`lua/jobs.lua` gives the agent a managed alternative to `bash` for long-running
+commands: scans, builds, servers, migrations, long test suites. The command
+returns immediately with a job id, while stdout and stderr go to a durable log.
+
+| Tool | Purpose |
+| --- | --- |
+| `bg_run` | Start a command in the background (`command`, optional `description`, `workdir`, `timeout_secs`, `wake`) |
+| `bg_status` | List jobs or show one job in detail |
+| `bg_logs` | Tail a job's log (`lines`, default 80) |
+| `bg_wait` | Wait for a job, bounded by `timeout_secs` (default 60) |
+| `bg_kill` | SIGKILL a running job |
+
+A job is owned by the session it was started from: it survives `/reload` and
+dies when that session ends. There is no detached daemon, so a job does not
+outlive Maki itself. Metadata and logs live under
+`<state_dir>/jobs/` (`~/.local/state/maki/jobs/` by default), in `index.json`
+and one `<id>.log` per job. The index keeps the 50 most recent records; running
+jobs are never pruned.
+
+From the input bar:
+
+```text
+/jobs              # list jobs
+/jobs <id>         # open one job's log
+/jobs clear        # remove finished jobs and their logs
+```
+
+Completion is reported through `maki.notify` (desktop notification with the
+`notifications = "notify"` setting in `init.lua`). Pass `wake = true` to
+`bg_run` to also wake the originating session with the completion note; it
+costs a turn, so it is off by default.
+
+Permissions: the plugin needs `fs_write` and `run` in `plugin.toml`. `bg_run`
+declares `permission_scopes = "command"`, so it has its own `[bg_run]` rules in
+`permissions.toml`; it does **not** inherit `[bash]` rules. With
+`always_yolo = true` (the default here) no prompt is shown, so treat `bg_run`
+as equivalent to `bash` when deciding what this config may run.
 
 ## Commands
 
