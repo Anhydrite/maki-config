@@ -223,18 +223,39 @@ local function is_done(state)
 end
 
 -- Split a markdown table row into cells, dropping the outer pipes.
+--
+-- UN `\|` EST UN CONTENU, PAS UN SEPARATEUR. Mesure du 2026-11-09 (AnhyWhere) :
+-- `REQ-20261109-13` a ete proposee DEUX relances de suite alors que sa ligne
+-- etait close et publiee. Sa demande contient `curl … \| sudo sh …`, et le
+-- decoupage sur tous les pipes faisait valoir `cells[3]` a un fragment de la
+-- demande : la ligne ne pouvait donc JAMAIS etre vue finie, quel que soit son
+-- etat. 17 lignes du SUIVI portent un pipe echappe ; une seule etait faussee,
+-- mais c'etait celle que la boucle redemandait.
 local function cells_of(line)
   local s = line
   if s:sub(1, 1) == "|" then
     s = s:sub(2)
   end
-  if s:sub(-1) == "|" then
+  if s:sub(-1) == "|" and s:sub(-2, -2) ~= "\\" then
     s = s:sub(1, -2)
   end
-  local out = {}
-  for cell in (s .. "|"):gmatch("([^|]*)|") do
-    out[#out + 1] = cell
+  local out, buf = {}, {}
+  local i, n = 1, #s
+  while i <= n do
+    local c = s:sub(i, i)
+    if c == "\\" and s:sub(i + 1, i + 1) == "|" then
+      buf[#buf + 1] = "|"
+      i = i + 2
+    elseif c == "|" then
+      out[#out + 1] = table.concat(buf)
+      buf = {}
+      i = i + 1
+    else
+      buf[#buf + 1] = c
+      i = i + 1
+    end
   end
+  out[#out + 1] = table.concat(buf)
   return out
 end
 
