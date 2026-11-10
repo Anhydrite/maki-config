@@ -22,7 +22,17 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
 CFG=$(mktemp -d)
-LOG="$HOME/.local/logs/maki/maki.log"
+# Le journal suit XDG_STATE_HOME (dirname(state_home)/logs/maki/maki.log) : avec
+# l'etat isole sous $CFG/state, il tombe sous $CFG/logs. Lire le journal reel
+# ferait echouer le test des qu'un autre run ecrit dedans.
+LOG="$CFG/logs/maki/maki.log"
+mkdir -p "$CFG/logs/maki"
+: > "$LOG"
+# L'authentification des fournisseurs vit dans le state dir : isole sans elle,
+# maki n'a aucun modele et sort AVANT que le plugin de test n'ait parle
+# (constate le 2026-11-10 : journal vide, quatre FAIL trompeurs).
+mkdir -p "$CFG/state/maki"
+cp -r "$HOME/.local/state/maki/auth" "$CFG/state/maki/auth" 2>/dev/null
 trap 'rm -rf "$CFG"' EXIT
 
 mkdir -p "$CFG/maki/lua"
@@ -69,23 +79,27 @@ maki.defer_fn(function()
   local vide = apres:find('"armed":true') == nil
   maki.log.info("relance-survie C vide=" .. tostring(vide))
 
-  -- D : une session occupee ne doit plus rendre la relance MUETTE. Le compteur
-  -- monte (l'etat n'est pas arme, donc le rappel differe ne fait rien), et au
-  -- plafond la boucle s'arrete en le disant au lieu de tourner a vide.
-  local max = select(1, T.retry_policy())
+  -- D : une session occupee ne doit plus rendre la relance MUETTE, et ne doit
+  -- plus l'eteindre non plus : passe le plafond on RALENTIT et on reste arme
+  -- (regle du proprietaire : active jusqu'a extinction explicite).
+  local max, rapide, lent = T.retry_policy()
   local occupe = T.state_for("selftest-occupe")
   T.schedule_retry("selftest-occupe", occupe)
   local compteur = tostring(occupe.retries)
   occupe.armed = true
   occupe.retries = max
   T.schedule_retry("selftest-occupe", occupe)
-  local desarme = tostring(occupe.armed == false)
-  maki.log.info("relance-survie D compteur=" .. compteur .. " desarme=" .. desarme)
+  local reste_arme = tostring(occupe.armed == true)
+  local ralenti = tostring(lent > rapide)
+  local depasse = tostring(occupe.retries == max + 1)
+  occupe.armed = false -- silence le minuteur differe de ce cas
+  maki.log.info("relance-survie D compteur=" .. compteur .. " arme=" .. reste_arme
+    .. " ralenti=" .. ralenti .. " depasse=" .. depasse)
 end, 500)
 LUA
 
 before=$(wc -l < "$LOG")
-XDG_CONFIG_HOME="$CFG" timeout 120 maki -p "$PROMPT" --max-turns 1 >/dev/null 2>/tmp/relance-survie.err
+XDG_CONFIG_HOME="$CFG" XDG_STATE_HOME="$CFG/state" timeout 120 maki -p "$PROMPT" --max-turns 1 >/dev/null 2>/tmp/relance-survie.err
 delta=$(tail -n +$((before + 1)) "$LOG")
 
 fail=0
@@ -105,9 +119,21 @@ check "B  armement relu apres vidage de la table" \
   "$(printf '%s\n' "$delta" | grep -o 'relance-survie B restaure=[a-z]*' | head -1 | sed 's/.*restaure=//')" "true"
 check "C  extinction non persistee" \
   "$(printf '%s\n' "$delta" | grep -o 'relance-survie C vide=[a-z]*' | head -1 | sed 's/.*vide=//')" "true"
-check "D  session occupee : reessai compte puis arret au plafond" \
-  "$(printf '%s\n' "$delta" | grep -o 'relance-survie D compteur=[0-9]* desarme=[a-z]*' | head -1 | sed 's/.*compteur=\([0-9]*\) desarme=\([a-z]*\)/\1 \2/')" \
-  "1 true"
+check "D  session occupee : reessai compte, ralenti, boucle toujours armee" \
+  "$(printf '%s\n' "$delta" | grep -o 'relance-survie D compteur=[0-9]* arme=[a-z]* ralenti=[a-z]* depasse=[a-z]*' | head -1 | sed 's/.*compteur=\([0-9]*\) arme=\([a-z]*\) ralenti=\([a-z]*\) depasse=\([a-z]*\)/\1 \2 \3 \4/')" \
+  "1 true true true"
+
+# LETAT REEL NE DOIT PAS ETRE TOUCHE. `maki.env.state_dir()` ne suit pas
+# XDG_CONFIG_HOME mais XDG_STATE_HOME : sans cette variable, le cas C (stop d'une
+# session de test) reecrivait le state.json REEL et desarmait la vraie relance
+# (constate le 2026-11-10 a 17:13). Un test ne doit jamais eteindre la boucle du
+# proprietaire.
+if printf '%s\n' "$delta" | grep -q "$HOME/.local/state/maki/relance"; then
+  echo "FAIL A2 etat reel touche par le test (XDG_STATE_HOME non isole)"
+  fail=1
+else
+  echo "OK   A2 etat isole hors de ~/.local/state"
+fi
 
 # Controle negatif du harnais : un plugin casse doit parler.
 BAD=$(mktemp -d)
@@ -116,7 +142,7 @@ cp lua/*.lua "$BAD/maki/lua/"
 cp plugin.toml "$BAD/maki/plugin.toml"
 printf 'require("relance")\n' > "$BAD/maki/init.lua"
 printf '\nthis is not lua\n' >> "$BAD/maki/lua/relance.lua"
-XDG_CONFIG_HOME="$BAD" timeout 60 maki -p "say ok" --max-turns 1 >"$BAD/out" 2>&1
+XDG_CONFIG_HOME="$BAD" XDG_STATE_HOME="$BAD/state" timeout 60 maki -p "say ok" --max-turns 1 >"$BAD/out" 2>&1
 if grep -q "syntax error" "$BAD/out"; then
   echo "OK   controle negatif (syntax error detectee)"
 else

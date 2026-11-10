@@ -40,10 +40,18 @@ local MAX_STRIKES = 2
 -- "working", prompt en file, ou texte en cours de frappe) et ne reprogrammait
 -- RIEN. Un `TurnEnd` etait la seule seconde chance ; si le proprietaire
 -- commencait a taper juste apres le rapport, aucun tour ne suivait et la
--- boucle restait ARMED mais muette (constate apres le run 18). On reessaie
--- desormais toutes les 3 s, avec un plafond pour ne pas s'acharner.
+-- boucle restait ARMED mais muette (constate apres le run 18).
+--
+-- MESURE DU 2026-11-10 (suite) : arreter au bout de 120 s contredisait la regle du
+-- proprietaire (« reste actif tant que je ne l'ai pas desactive »). Taper une
+-- longue question `/btw` occupe la session plusieurs minutes ; la boucle doit
+-- alors ATTENDRE son tour, pas s'eteindre. Au-dela du plafond on RALENTIT donc
+-- le sondage au lieu d'arreter, et les evenements qui rendent la parole
+-- (SessionStatusChanged -> idle, InputChanged) remettent le compteur a zero et
+-- reveillent la relance tout de suite.
 local RETRY_DELAY_MS = 3000
 local MAX_OCCUPIED_RETRIES = 40
+local SLOW_RETRY_DELAY_MS = 15000
 
 local step -- forward: schedule_retry below calls it
 -- 0 = AUCUN PLAFOND, et c'est le defaut. Demande du proprietaire, 2026-10-28 : « il faut que /relacne
@@ -582,24 +590,31 @@ local function resume_note(st, path, total, done, unfinished, traitable)
 end
 
 -- La session est occupee : ne pas prendre la parole, mais ne pas mourir non
--- plus. On reessaie, et on finit par le dire si la place ne se libere jamais.
+-- plus. On reessaie ; passe le plafond on ralentit au lieu d'arreter, parce que
+-- la boucle doit rester active jusqu'a extinction explicite. Seul un evenement
+-- qui rend la parole peut legitimer un arret, jamais l'attente elle-meme.
 local function schedule_retry(session_id, st)
   local attempts = (st.retries or 0) + 1
-  if attempts > MAX_OCCUPIED_RETRIES then
-    st.retries = 0
-    return stop(session_id, string.format(
-      "session occupée pendant %d réessais (%.0f s) : relance arrêtée pour ne pas boucler",
-      MAX_OCCUPIED_RETRIES, MAX_OCCUPIED_RETRIES * RETRY_DELAY_MS / 1000), true)
-  end
   st.retries = attempts
-  debug(string.format("relance: voie occupée, réessai %d/%d dans %d ms",
-    attempts, MAX_OCCUPIED_RETRIES, RETRY_DELAY_MS))
+  local delay = RETRY_DELAY_MS
+  if attempts > MAX_OCCUPIED_RETRIES then
+    delay = SLOW_RETRY_DELAY_MS
+    if (attempts - MAX_OCCUPIED_RETRIES) % 20 == 1 then
+      log.info(string.format(
+        "relance: session occupee depuis %d reessais, sondage ralenti a %.0f s (boucle toujours active)",
+        attempts, SLOW_RETRY_DELAY_MS / 1000
+      ))
+    end
+  else
+    debug(string.format("relance: voie occupée, réessai %d/%d dans %d ms",
+      attempts, MAX_OCCUPIED_RETRIES, delay))
+  end
   maki.defer_fn(function()
     local current = sessions[session_id]
     if current and current.armed then
       step(session_id, false, nil)
     end
-  end, RETRY_DELAY_MS)
+  end, delay)
 end
 
 -- Decide, then wake. `kick` is true when the user just ran /relance and the
@@ -873,6 +888,57 @@ maki.api.register_command({
   end,
 })
 
+-- LA PAROLE RENDUE. `step` s'efface quand le proprietaire occupe la session ;
+-- ces deux evenements sont le moment ou il la rend, et sans eux le sondage
+-- reste seul juge. Une session qui passe a `idle`, ou une barre de saisie qui
+-- change d'etat, remet le compteur a zero et reveille la relance aussitot.
+-- `InputChanged` precede le tour : c'est ce qui rattrape le cas `/btw`, ou la
+-- session principale ne recoit aucun `TurnEnd` pendant que l'agent parallele
+-- repond.
+maki.api.create_autocmd("SessionStatusChanged", {
+  callback = function(ev)
+    local data = ev.data or {}
+    local id = data.session_id or maki.session.current()
+    if not id or data.status ~= "idle" then
+      return
+    end
+    local st = sessions[id]
+    if not (st and st.armed) then
+      return
+    end
+    st.retries = 0
+    maki.defer_fn(function()
+      local s2 = sessions[id]
+      if s2 and s2.armed then
+        step(id, false, nil)
+      end
+    end, 500)
+  end,
+})
+
+maki.api.create_autocmd("InputChanged", {
+  callback = function(ev)
+    local id = (ev.data and ev.data.session_id) or maki.session.current()
+    local st = id and sessions[id]
+    if not (st and st.armed and (st.retries or 0) > 0) then
+      -- Rien n'attendait la place : eviter de traverser `step` a chaque touche.
+      return
+    end
+    local input = maki.ui.input()
+    if input and input.session_id == id and (input.text or "") ~= "" then
+      -- La frappe continue : le sondage differe s'en occupe, pas la touche.
+      return
+    end
+    st.retries = 0
+    maki.defer_fn(function()
+      local s2 = sessions[id]
+      if s2 and s2.armed then
+        step(id, false, nil)
+      end
+    end, 300)
+  end,
+})
+
 maki.api.create_autocmd("TurnEnd", {
   callback = function(ev)
     local id = ev.data and ev.data.session_id
@@ -970,7 +1036,7 @@ return {
   _test = {
     state_for = state_for,
     schedule_retry = schedule_retry,
-    retry_policy = function() return MAX_OCCUPIED_RETRIES, RETRY_DELAY_MS end,
+    retry_policy = function() return MAX_OCCUPIED_RETRIES, RETRY_DELAY_MS, SLOW_RETRY_DELAY_MS end,
     state_file = state_file,
     read_state = read_state_file,
     write_state = write_state_file,

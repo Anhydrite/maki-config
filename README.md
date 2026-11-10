@@ -310,9 +310,12 @@ every relaunch, so it tells the truth about what happened.
 
 The loop never takes the floor from you: if the session is still `working`, has
 a queued prompt, or has text in the input box, it steps aside — but it retries
-every 3 s instead of going silent (40 attempts, then it stops and says so). It
-does not wait for the next `TurnEnd`, which may never come if you start typing
-right after a report.
+every 3 s instead of going silent, and after 40 attempts it only slows down to
+15 s rather than stopping: waiting is not a reason to end the loop. It also wakes
+on its own when the floor comes back — `SessionStatusChanged` to `idle` and
+`InputChanged` both reset the counter and call `step` at once, which covers the
+`/btw` case where the main session receives no `TurnEnd` while the parallel
+agent answers.
 
 ## Commands
 
