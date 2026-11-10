@@ -1,5 +1,9 @@
 -- /relance — auto-relaunch driven by the project's suivi.md.
 --
+-- `/relance init` creates docs/suivi.md with the writing rules when no ledger
+-- exists yet (never overwriting one), so arming never dies on "no suivi.md
+-- found" without a way forward.
+--
 -- The file is the arbiter: a `REQ-YYYYMMDD-NN` row is finished when its state
 -- cell starts with "fait" (which covers "fait, publié" and "fait, à publier"),
 -- and a checkbox case is finished when it is `[x]`. Everything else is work
@@ -367,6 +371,100 @@ local function rel(path)
   return path
 end
 
+-- /relance init — LE FICHIER NE DOIT PAS EXISTER POUR ETRE CREE. Le gabarit
+-- DICTE l'ecriture (formes lues, vocabulaire des etats, regles de tenue) parce
+-- qu'un suivi vide ne dit rien : l'agent qui le remplit sans regle ecrit des
+-- lignes que ce module ne sait pas lire, et la relance tourne a vide.
+--
+-- La cible par defaut est docs/suivi.md : c'est la ou le proprietaire range ses
+-- suivis (docs/design/SUIVI.md dans ses projets), donc on ne cree pas un
+-- suivi.md a la racine d'un depot qui a deja une arborescence docs/.
+local INIT_TARGET = "docs/suivi.md"
+
+local function ledger_template()
+  return table.concat({
+    "# suivi — source de verite de /relance",
+    "",
+    "Ce fichier est le seul juge de l'avancement. La relance le relit a chaque tour,",
+    "reprend une seule tache, et s'arrete quand plus aucune ligne n'est ouverte. Elle",
+    "ne se fie ni au resume de la conversation ni a ce que l'agent raconte.",
+    "",
+    "## Comment ecrire une ligne",
+    "",
+    "Deux formes sont lues, et elles peuvent cohabiter dans le meme fichier :",
+    "",
+    "1. Ligne de tableau, identifiant REQ :",
+    "",
+    "   | ID | Demande | Etat | Preuve |",
+    "   | --- | --- | --- | --- |",
+    "   | REQ-AAAAMMJJ-NN | ce qu'il faut faire, en une phrase actionnable | a faire | test ou chemin |",
+    "",
+    "   Seules les lignes dont la colonne 1 vaut REQ- suivi de 8 chiffres, d'un tiret",
+    "   et d'un numero sont comptees. Les autres lignes de tableau sont ignorees.",
+    "",
+    "2. Case a cocher : `- [ ] intitule` ouverte, `- [x] intitule` finie.",
+    "",
+    "## Vocabulaire des etats (colonne 3)",
+    "",
+    "| Etat ecrit | Ce que la relance en fait |",
+    "| --- | --- |",
+    "| a faire, en cours, tout le reste | travail : la ligne est reprise |",
+    "| fait, termine, livre, publie, solde, done, ok | finie : ignoree (le prefixe suffit, « fait, publie » passe) |",
+    "| attente de decision, arbitrage | posee en question au proprietaire, jamais travaillee |",
+    "| attente — publication, attente d'un acte du proprietaire | idem : un acte d'exploitation n'est pas du code |",
+    "| decision rendue (a) | debloquee : redevient du travail |",
+    "",
+    "## Les regles de tenue",
+    "",
+    "- Une ligne par tache, et on n'efface jamais une ligne finie : le fichier est l'historique.",
+    "- Le tour qui fait le travail met SA ligne a jour dans le meme geste. Un tour qui",
+    "  n'ecrit pas compte comme un tour sans progres, et deux d'affilee arretent la relance.",
+    "- Jamais « fait » sans preuve : la colonne 4 cite le fichier, le test ou la sortie obtenue.",
+    "- Un identifiant neuf a chaque demande, jamais reutilise, jamais renummerote.",
+    "- Une ligne que l'agent ne peut pas traiter (decision a rendre, geste d'exploitation)",
+    "  reste en attente avec la raison ecrite ; la relance la posera en question au lieu",
+    "  de la redemander.",
+    "- Une tache par relance : c'est le fichier qui declare le lot termine, pas l'agent.",
+    "- Si tout est fini, vider le tableau (ou tout passer a « fait ») : une relance sur un",
+    "  fichier vide s'arrete d'elle-meme.",
+    "",
+    "## Premier etat — remplacer la ligne modele",
+    "",
+    "| ID | Demande | Etat | Preuve |",
+    "| --- | --- | --- | --- |",
+    "| REQ-AAAAMMJJ-NN | decris la premiere tache ici | a faire | |",
+    "",
+    "La ligne `REQ-AAAAMMJJ-NN` est un modele : elle n'est PAS comptee par la relance",
+    "(il faut 8 chiffres), donc ce fichier neuf ne declenche aucune relance tant que tu",
+    "n'as pas ecrit une vraie ligne. Ensuite : `/relance`.",
+    "",
+  }, "\n")
+end
+
+-- Cree le suivi SEULEMENT s'il n'existe deja nulle part : on interroge toute la
+-- chaine de CANDIDATES (dont docs/suivi.md) depuis le cwd, puis la cible exacte.
+-- Un fichier existant n'est jamais ecrase : c'est l'historique du projet.
+local function init_ledger(cwd, wanted)
+  local existing = find_ledger(cwd, wanted)
+  if existing then
+    return nil, "exists", existing
+  end
+  local target = (wanted and wanted ~= "") and wanted or INIT_TARGET
+  local path = target
+  if path:sub(1, 1) ~= "/" and cwd then
+    path = maki.fs.joinpath(cwd, path)
+  end
+  if maki.fs.read(path) then
+    return nil, "exists", path
+  end
+  maki.fs.mkdir(maki.fs.dirname(path), { parents = true })
+  local ok, err = maki.fs.write(path, ledger_template())
+  if not ok then
+    return nil, tostring(err), path
+  end
+  return path, nil, nil
+end
+
 local function stop(session_id, reason, notify)
   local st = sessions[session_id]
   if st then
@@ -505,7 +603,7 @@ local function step(session_id, kick, reason_from_turn)
   local cwd = snapshot.cwd or maki.uv.cwd()
   local path, text = find_ledger(cwd, st.path)
   if not path then
-    return stop(session_id, "aucun suivi.md trouvé depuis " .. rel(cwd or "?"), true)
+    return stop(session_id, "aucun suivi.md trouvé depuis " .. rel(cwd or "?") .. " — /relance init crée " .. INIT_TARGET, true)
   end
 
   local total, done, unfinished = parse(text)
@@ -607,7 +705,7 @@ local function status_line(session_id)
   local cwd = (snapshot and snapshot.cwd) or maki.uv.cwd()
   local path, text = find_ledger(cwd, st.path)
   if not path then
-    return "Relance : active, mais aucun suivi.md trouvé."
+    return "Relance : active, mais aucun suivi.md trouvé. /relance init crée " .. INIT_TARGET .. "."
   end
   local total, done, unfinished = parse(text)
   local fichier = state_file()
@@ -628,7 +726,7 @@ end
 
 maki.api.register_command({
   name = "/relance",
-  description = "Auto-relance l'agent tant que suivi.md garde des tâches non finies, sans plafond par défaut ; l'armement est écrit sur disque, donc il survit à /reload, à un redémarrage et à une autocompaction. /relance arme (jamais n'éteint) ; /relance off arrête ; /relance 20 pose un plafond ; /relance <chemin> choisit le fichier.",
+  description = "Auto-relance l'agent tant que suivi.md garde des tâches non finies, sans plafond par défaut ; l'armement est écrit sur disque, donc il survit à /reload, à un redémarrage et à une autocompaction. /relance arme (jamais n'éteint) ; /relance init crée docs/suivi.md avec le gabarit et les règles d'écriture (jamais si un suivi existe déjà) ; /relance off arrête ; /relance 20 pose un plafond ; /relance <chemin> choisit le fichier.",
   nargs = "*",
   handler = function(opts)
     local id = current_session()
@@ -638,6 +736,28 @@ maki.api.register_command({
     local st = state_for(id)
     local arg = trim(opts.args or "")
     local lower = arg:lower()
+
+    -- /relance init : cree docs/suivi.md quand aucun suivi n'existe deja, avec le
+    -- gabarit qui dicte l'ecriture. Sans ce geste, armer la relance ne trouvait
+    -- rien et s'arretait sur « aucun suivi.md trouve » — le proprietaire a demande
+    -- que la commande sache poser le fichier au lieu de seulement le chercher.
+    if lower == "init" or lower:match("^init%s") then
+      local voulu = trim(arg:sub(5))
+      local snapshot = maki.session.read({ session = id })
+      local cwd = (snapshot and snapshot.cwd) or maki.uv.cwd()
+      local path, why, known = init_ledger(cwd, voulu)
+      if not path then
+        if why == "exists" then
+          maki.ui.flash("Relance init : un suivi existe deja (" .. rel(known) .. "), rien n'a ete cree. Pour en changer : /relance " .. rel(known))
+        else
+          maki.ui.flash("Relance init : " .. rel(tostring(known or voulu)) .. " n'a pas pu etre cree (" .. tostring(why) .. ")")
+        end
+        return
+      end
+      maki.ui.flash("Relance init : " .. rel(path) .. " cree avec son gabarit et ses regles. Ecris ta premiere ligne REQ (ou coche une case), puis /relance.")
+      log.info("relance: init created " .. path)
+      return
+    end
 
     if lower == "off" or lower == "stop" or lower == "arrêt" or lower == "arret" or lower == "0" then
       if not st.armed then
@@ -693,7 +813,7 @@ maki.api.register_command({
     local path, text = find_ledger(cwd, st.path)
     if not path then
       st.armed = false
-      maki.ui.flash("Relance : aucun suivi.md trouvé depuis " .. rel(cwd or "?"))
+      maki.ui.flash("Relance : aucun suivi.md trouvé depuis " .. rel(cwd or "?") .. " — /relance init crée " .. INIT_TARGET .. ".")
       return
     end
     local total, done, unfinished = parse(text)

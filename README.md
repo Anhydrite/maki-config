@@ -10,6 +10,7 @@ rules, and Lua plugins. Clone it on a new machine and you get everything back.
 | `init.lua` | Settings (`always_yolo`) and plugin loading |
 | `permissions.toml` | Bash/shell permission rules |
 | `plugin.toml` | Permissions for the Lua files in this directory |
+| `lua/relance.lua` | `/relance`: auto-relaunch driven by the project's `suivi.md` |
 | `lua/ocgo.lua` | `ocgo` provider: OpenCode Go + the DeepSeek V4 thinking-mode fix |
 | `lua/tps.lua` | Last-turn output speed (`tok/s`) under the chat input |
 | `lua/autocompact.lua` | Auto-compaction at 30% of the context window, and an automatic resume afterwards |
@@ -19,6 +20,7 @@ rules, and Lua plugins. Clone it on a new machine and you get everything back.
 | `plugin/tps.lua` | Package entry point for the speed counter |
 | `plugin/autocompact.lua` | Package entry point for auto-compaction |
 | `plugin/jobs.lua` | Package entry point for background jobs |
+| `plugin/relance.lua` | Package entry point for `/relance` |
 | `plugin/handoff.lua` | Package entry point for handoff mode |
 | `tests/resume-matrix.sh` | Proof of the resume path: five isolated Maki runs, expected matrix in the header |
 | `commands/humanizer.md` | `/user:humanizer <text>` — wraps the `humanizer` skill |
@@ -274,6 +276,36 @@ tools that start processes (like the `bg_run` job runner) are not intercepted
 (the prompt forbids them, but there is no hard guarantee), and a line typed
 with `!` in the input bypasses it on purpose, since the human may always run
 what they want.
+
+## Relance mode
+
+`/relance` wakes the agent after each turn while the project ledger still holds
+unfinished work. The ledger is the arbiter, never the transcript: a `REQ-…` row
+is done when its state cell starts with `fait` (`fait, publié` passes) and a
+checkbox is done when it is `[x]`.
+
+```text
+/relance init            # create docs/suivi.md with the template and the rules
+/relance                 # arm (never disarms)
+/relance off             # stop
+/relance status          # which file, how many lines left, strikes
+/relance 20              # cap at 20 relaunches (default: no cap)
+/relance path/to/suivi.md  # pick another ledger
+```
+
+`/relance init` only writes when no ledger exists yet: it searches the usual
+candidates from the working directory upwards (`suivi.md`, `SUIVI.md`,
+`docs/design/SUIVI.md`, `docs/suivi.md`, …) and refuses to overwrite one. The
+created file documents the two accepted shapes, the state vocabulary (`fait`,
+`terminé`, `livré`… are done; `décision`/`arbitrage` and `attente — publication`
+are blocked and get raised as questions), and the rule that the turn doing the
+work updates its own row. Its example identifiers (`REQ-AAAAMMJJ-NN`) are not
+counted, so a fresh ledger does not launch a loop until a real line is written.
+
+Guards, in order: no unfinished line, cancelled turn, two relaunches without the
+file changing, then the optional cap. Arming is written to
+`~/.local/state/maki/relance/state.json`, so it survives `/reload`, a restart
+and an auto-compaction.
 
 ## Commands
 
