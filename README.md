@@ -305,7 +305,14 @@ counted, so a fresh ledger does not launch a loop until a real line is written.
 Guards, in order: no unfinished line, cancelled turn, two relaunches without the
 file changing, then the optional cap. Arming is written to
 `~/.local/state/maki/relance/state.json`, so it survives `/reload`, a restart
-and an auto-compaction.
+and an auto-compaction. The file also records `runs` and the ledger `path` after
+every relaunch, so it tells the truth about what happened.
+
+The loop never takes the floor from you: if the session is still `working`, has
+a queued prompt, or has text in the input box, it steps aside — but it retries
+every 3 s instead of going silent (40 attempts, then it stops and says so). It
+does not wait for the next `TurnEnd`, which may never come if you start typing
+right after a report.
 
 ## Commands
 

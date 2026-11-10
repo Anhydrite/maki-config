@@ -36,6 +36,16 @@
 -- comptent plus comme « sans progres », puisque le fichier n'a pas bouge.
 
 local MAX_STRIKES = 2
+-- MESURE DU 2026-11-10 : `step` s'efface quand la session est occupee (statut
+-- "working", prompt en file, ou texte en cours de frappe) et ne reprogrammait
+-- RIEN. Un `TurnEnd` etait la seule seconde chance ; si le proprietaire
+-- commencait a taper juste apres le rapport, aucun tour ne suivait et la
+-- boucle restait ARMED mais muette (constate apres le run 18). On reessaie
+-- desormais toutes les 3 s, avec un plafond pour ne pas s'acharner.
+local RETRY_DELAY_MS = 3000
+local MAX_OCCUPIED_RETRIES = 40
+
+local step -- forward: schedule_retry below calls it
 -- 0 = AUCUN PLAFOND, et c'est le defaut. Demande du proprietaire, 2026-10-28 : « il faut que /relacne
 -- reste actif tant que je ne l'ai pas desactive ». Le plafond de 15 arretait la boucle sans que
 -- personne ne l'ait demande ; `/relance 20` en pose un explicitement, et `/relance` seul l'eteint.
@@ -301,6 +311,7 @@ local function state_for(session_id)
       path = nil,
       max = DEFAULT_MAX,
       restored = false,
+      retries = 0,
     }
   end
   local st = sessions[session_id]
@@ -313,6 +324,7 @@ local function state_for(session_id)
       path = nil,
       max = DEFAULT_MAX,
       restored = false,
+      retries = 0,
     }
     -- Un armement ecrit avant un `/reload` ou un redemarrage reprend ici : sans
     -- cette reprise, la boucle s'eteint en silence (mesure du 2026-11-04).
@@ -569,9 +581,30 @@ local function resume_note(st, path, total, done, unfinished, traitable)
   )
 end
 
+-- La session est occupee : ne pas prendre la parole, mais ne pas mourir non
+-- plus. On reessaie, et on finit par le dire si la place ne se libere jamais.
+local function schedule_retry(session_id, st)
+  local attempts = (st.retries or 0) + 1
+  if attempts > MAX_OCCUPIED_RETRIES then
+    st.retries = 0
+    return stop(session_id, string.format(
+      "session occupée pendant %d réessais (%.0f s) : relance arrêtée pour ne pas boucler",
+      MAX_OCCUPIED_RETRIES, MAX_OCCUPIED_RETRIES * RETRY_DELAY_MS / 1000), true)
+  end
+  st.retries = attempts
+  debug(string.format("relance: voie occupée, réessai %d/%d dans %d ms",
+    attempts, MAX_OCCUPIED_RETRIES, RETRY_DELAY_MS))
+  maki.defer_fn(function()
+    local current = sessions[session_id]
+    if current and current.armed then
+      step(session_id, false, nil)
+    end
+  end, RETRY_DELAY_MS)
+end
+
 -- Decide, then wake. `kick` is true when the user just ran /relance and the
 -- session is sitting idle, so the first run does not wait for a human turn.
-local function step(session_id, kick, reason_from_turn)
+step = function(session_id, kick, reason_from_turn)
   local st = state_for(session_id)
   if not st.armed then
     return
@@ -655,6 +688,7 @@ local function step(session_id, kick, reason_from_turn)
   end
   if not kick and (snapshot.status == "working" or queued > 0 or composing) then
     debug("left for the next run: status " .. tostring(snapshot.status))
+    schedule_retry(session_id, st)
     return
   end
 
@@ -669,11 +703,13 @@ local function step(session_id, kick, reason_from_turn)
     st.runs = st.runs + 1
     st.last_sig = sig
     st.path = path
+    st.retries = 0
     local envoye, erreur = maki.session.prompt(question, { session = session_id })
     if not envoye then
       st.runs = st.runs - 1
       return stop(session_id, "prompt refusé : " .. tostring(erreur), true)
     end
+    write_state_file()
     log.info(string.format("relance: questions posees pour %s (%d bloquees)", session_id, #blocked))
     return
   end
@@ -683,12 +719,17 @@ local function step(session_id, kick, reason_from_turn)
   st.runs = st.runs + 1
   st.last_sig = sig
   st.path = path
+  st.retries = 0
 
   local sent, send_err = maki.session.prompt(text_note, { session = session_id })
   if not sent then
     st.runs = st.runs - 1
     return stop(session_id, "prompt refusé : " .. tostring(send_err), true)
   end
+  -- L'etat sur disque doit dire la verite : `runs` et `path` n'etaient ecrits
+  -- qu'a l'armement et a l'arret, et le fichier affichait « runs: 0 » apres
+  -- dix-huit relances.
+  write_state_file()
 
   log.info(string.format(
     "relance: run %d/%s for %s (%d unfinished, %d/%d done) %s",
@@ -928,6 +969,8 @@ return {
   is_done = is_done,
   _test = {
     state_for = state_for,
+    schedule_retry = schedule_retry,
+    retry_policy = function() return MAX_OCCUPIED_RETRIES, RETRY_DELAY_MS end,
     state_file = state_file,
     read_state = read_state_file,
     write_state = write_state_file,

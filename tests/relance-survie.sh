@@ -68,6 +68,19 @@ maki.defer_fn(function()
   local apres = maki.fs.read(chemin) or ""
   local vide = apres:find('"armed":true') == nil
   maki.log.info("relance-survie C vide=" .. tostring(vide))
+
+  -- D : une session occupee ne doit plus rendre la relance MUETTE. Le compteur
+  -- monte (l'etat n'est pas arme, donc le rappel differe ne fait rien), et au
+  -- plafond la boucle s'arrete en le disant au lieu de tourner a vide.
+  local max = select(1, T.retry_policy())
+  local occupe = T.state_for("selftest-occupe")
+  T.schedule_retry("selftest-occupe", occupe)
+  local compteur = tostring(occupe.retries)
+  occupe.armed = true
+  occupe.retries = max
+  T.schedule_retry("selftest-occupe", occupe)
+  local desarme = tostring(occupe.armed == false)
+  maki.log.info("relance-survie D compteur=" .. compteur .. " desarme=" .. desarme)
 end, 500)
 LUA
 
@@ -92,6 +105,9 @@ check "B  armement relu apres vidage de la table" \
   "$(printf '%s\n' "$delta" | grep -o 'relance-survie B restaure=[a-z]*' | head -1 | sed 's/.*restaure=//')" "true"
 check "C  extinction non persistee" \
   "$(printf '%s\n' "$delta" | grep -o 'relance-survie C vide=[a-z]*' | head -1 | sed 's/.*vide=//')" "true"
+check "D  session occupee : reessai compte puis arret au plafond" \
+  "$(printf '%s\n' "$delta" | grep -o 'relance-survie D compteur=[0-9]* desarme=[a-z]*' | head -1 | sed 's/.*compteur=\([0-9]*\) desarme=\([a-z]*\)/\1 \2/')" \
+  "1 true"
 
 # Controle negatif du harnais : un plugin casse doit parler.
 BAD=$(mktemp -d)
