@@ -81,8 +81,6 @@ local function sample()
   if r then
     shown = shown and shown + ALPHA * (r - shown) or r
   end
-  -- secondes depuis le dernier saut (remises a zero a chaque etape), en
-  -- dixiemes: la ligne se rafraichit a chaque tick de 100 ms
   show(string.format("%.1f tok/s", shown or ema_rate()))
 end
 
