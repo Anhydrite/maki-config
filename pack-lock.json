@@ -2,7 +2,7 @@
   "packages": {
     "stress-test-user-feature": {
       "src": "https://github.com/Anhydrite/stress-test-user-feature",
-      "rev": "ef652f1c701e46e0abb5190ccfaab252eee4855a"
+      "rev": "7ed550a"
     }
   }
 }
