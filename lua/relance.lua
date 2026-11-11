@@ -252,6 +252,8 @@ local function write_state_file()
         runs = st.runs or 0,
         strikes = st.strikes or 0,
         last_sig = st.last_sig,
+        last_prompt_at = st.last_prompt_at,
+        last_prompt_sig = st.last_prompt_sig,
       }
     end
   end
@@ -723,6 +725,30 @@ local function schedule_retry(session_id, st)
   end, delay)
 end
 
+-- MESURE DU 2026-11-11 (constat du proprietaire : « corriger le bug de /relance qui donne
+-- 2 fois la relance »). TROIS evenements rapproches appellent `step` pour la MEME fin de
+-- tour : `TurnEnd` (+300 ms), `SessionStatusChanged` -> idle (+500 ms) et `InputChanged`
+-- (+300 ms). Quand la session est deja `idle` au moment du `TurnEnd`, les deux premiers
+-- passent le garde « occupe » et postent DEUX prompts : l'agent recoit deux fois la meme
+-- relance, pour la meme ligne. Une relance est un TOUR : un second prompt dans la meme
+-- respiration est un doublon, pas une seconde chance.
+--
+-- Le critere est DOUBLE, et c'est ce qui le rend sur : la MEME signature de fichier (le
+-- registre n'a donc pas bouge depuis le dernier prompt) ET une fenetre courte. Une
+-- signature differente est une vraie relance, meme une seconde plus tard ; une signature
+-- identique apres la fenetre est le tour qui n'a rien change, que les strikes doivent voir.
+local PROMPT_DEDUP_SECS = 5
+
+local function estDoublon(st, sig, maintenant)
+  if not st or not st.last_prompt_at or not st.last_prompt_sig then
+    return false
+  end
+  if st.last_prompt_sig ~= sig then
+    return false
+  end
+  return (maintenant - st.last_prompt_at) < PROMPT_DEDUP_SECS
+end
+
 -- Decide, then wake. `kick` is true when the user just ran /relance and the
 -- session is sitting idle, so the first run does not wait for a human turn.
 step = function(session_id, kick, reason_from_turn)
@@ -762,6 +788,15 @@ step = function(session_id, kick, reason_from_turn)
 
   local total, done, unfinished = parse(text)
   local sig = signature(text, total, done)
+
+  local maintenant = os.time()
+  if estDoublon(st, sig, maintenant) then
+    -- Deux evenements pour un seul tour : le second ne poste rien. Il ne compte pas
+    -- comme un strike non plus — ce n'est pas un tour sans progres, c'est le meme tour.
+    debug("relance: doublon d'evenement ignore (prompt poste il y a "
+      .. tostring(maintenant - (st.last_prompt_at or maintenant)) .. " s)")
+    return
+  end
 
   if #unfinished == 0 then
     return stop(session_id, string.format("terminé, %d/%d lignes finies dans %s", done, total, rel(path)), true)
@@ -830,6 +865,8 @@ step = function(session_id, kick, reason_from_turn)
       st.runs = st.runs - 1
       return stop(session_id, "prompt refusé : " .. tostring(erreur), true)
     end
+    st.last_prompt_at = maintenant
+    st.last_prompt_sig = sig
     write_state_file()
     log.info(string.format("relance: questions posees pour %s (%d bloquees)", session_id, #blocked))
     return
@@ -847,6 +884,8 @@ step = function(session_id, kick, reason_from_turn)
     st.runs = st.runs - 1
     return stop(session_id, "prompt refusé : " .. tostring(send_err), true)
   end
+  st.last_prompt_at = maintenant
+  st.last_prompt_sig = sig
   -- L'etat sur disque doit dire la verite : `runs` et `path` n'etaient ecrits
   -- qu'a l'armement et a l'arret, et le fichier affichait « runs: 0 » apres
   -- dix-huit relances.
@@ -1145,6 +1184,8 @@ return {
     -- avec un octet isole (2026-11-11), et `maki.session.prompt` la refusait.
     tronque = tronque,
     resume_note = resume_note,
+    estDoublon = estDoublon,
+    dedup_window = function() return PROMPT_DEDUP_SECS end,
     state_for = state_for,
     schedule_retry = schedule_retry,
     retry_policy = function() return MAX_OCCUPIED_RETRIES, RETRY_DELAY_MS, SLOW_RETRY_DELAY_MS end,
