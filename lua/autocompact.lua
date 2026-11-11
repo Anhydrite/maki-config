@@ -416,6 +416,7 @@ local function status_text()
     limit = limit_for(window)
     local percent = window > 0 and (size / window * 100) or 0
     lines[#lines + 1] = string.format("Context: %s / %s (%.1f%%)", human(size), human(window), percent)
+    lines[#lines + 1] = "Status: " .. tostring(snapshot.status)
     if cfg.percent > 0 then
       lines[#lines + 1] = string.format("Compact at: %s (%d%%)", human(limit), cfg.percent)
     else
@@ -460,6 +461,11 @@ maki.api.register_command({
     if head == "on" or head == "off" then
       cfg.enabled = head == "on"
       maki.notify("Auto-compaction " .. (cfg.enabled and "on" or "off"))
+      -- Enabling on a session already over the limit should not wait for the
+      -- next turn to fire.
+      if cfg.enabled then
+        check_session(nil, "settings")
+      end
       return
     end
 
@@ -469,6 +475,7 @@ maki.api.register_command({
       end
       forget_after()
       maki.notify(string.format("Auto-compaction reset to %d%%", configured.percent))
+      check_session(nil, "settings")
       return
     end
 
@@ -482,6 +489,7 @@ maki.api.register_command({
       cfg.percent = 0
       forget_after()
       maki.notify(string.format("Auto-compaction at %s tokens", human(cfg.tokens)))
+      check_session(nil, "settings")
       return
     end
 
@@ -530,6 +538,7 @@ maki.api.register_command({
       cfg.tokens = 0
       forget_after()
       maki.notify(string.format("Auto-compaction at %d%% of the context window", cfg.percent))
+      check_session(nil, "settings")
       return
     end
 
