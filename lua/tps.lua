@@ -1,10 +1,15 @@
 -- Real-time tokens-per-second, ported from pi-token-speed.
 --
--- Maki fires TextDelta, ThinkingDelta and ToolCallDelta while the model
--- streams, so the rate is measured from the deltas themselves instead of
+-- On a build that fires TextDelta, ThinkingDelta and ToolCallDelta while the
+-- model streams, the rate is measured from the deltas themselves instead of
 -- polling session.read at round boundaries. Tool execution time is paused
 -- out, and TurnEnd reconciles the exact provider usage so the final average
 -- is not an estimate.
+--
+-- Stock Maki (0.6.5 as released) has neither those events nor maki.uv.hrtime.
+-- There the plugin falls back to TurnStart -> TurnEnd wall time minus
+-- ToolDone.duration_ms, using os.time() as the clock. Same figure, coarser
+-- resolution, no live updates while the model streams.
 
 local CONFIG_FILE = "tps.json"
 local MIN_WINDOW_MS = 100
@@ -58,7 +63,10 @@ local function now_ms()
   if maki.uv.hrtime then
     return maki.uv.hrtime() / 1e6
   end
-  return os.clock() * 1000
+  -- Stock Maki has no hrtime. os.clock() counts CPU time, which barely moves
+  -- while the process waits on the network, so a turn would read as instant.
+  -- os.time() is wall time, at one-second resolution.
+  return os.time() * 1000
 end
 
 local function config_path()
@@ -239,14 +247,17 @@ function Engine.new()
     streaming = false,
     paused = false,
     tokens = 0,
-    turn_start = 0,
-    start_time = 0,
-    end_time = 0,
-    ttft_start = 0,
-    ttft_end = 0,
-    pause_start = 0,
+    turn_start = nil,
+    start_time = nil,
+    end_time = nil,
+    ttft_start = nil,
+    ttft_end = nil,
+    pause_start = nil,
     paused_ms = 0,
+    tool_ms = 0,
+    saw_delta = false,
     tps = 0,
+    displayed = 0,
     window = Window.new(DEFAULTS.slidingWindow),
     cfg = copy(DEFAULTS),
     provider = nil,
@@ -258,12 +269,14 @@ function Engine:reset(cfg, provider)
   self.paused = false
   self.tokens = 0
   self.turn_start = now_ms()
-  self.start_time = 0
-  self.end_time = 0
+  self.start_time = nil
+  self.end_time = nil
   self.ttft_start = now_ms()
-  self.ttft_end = 0
-  self.pause_start = 0
+  self.ttft_end = nil
+  self.pause_start = nil
   self.paused_ms = 0
+  self.tool_ms = 0
+  self.saw_delta = false
   self.tps = 0
   self.window = Window.new(cfg.slidingWindow)
   self.cfg = cfg
@@ -281,7 +294,7 @@ function Engine:start()
 end
 
 function Engine:stop_ttft()
-  if self.ttft_end == 0 then
+  if not self.ttft_end then
     self.ttft_end = now_ms()
   end
 end
@@ -294,6 +307,7 @@ function Engine:record(delta)
   if self.paused then
     self:resume()
   end
+  self.saw_delta = true
   local n = self.cfg.countStrategy == "direct" and 1 or estimate_tokens(delta)
   if n <= 0 then
     return
@@ -321,39 +335,49 @@ function Engine:resume()
 end
 
 function Engine:stop()
+  -- Set the end even when no delta ever started the stream: a stock Maki
+  -- fires no delta events, and the turn average still needs a stop time.
+  self.end_time = now_ms()
   if not self.streaming then
     return
   end
   self:resume()
   self.streaming = false
-  self.end_time = now_ms()
   self.window:reset()
 end
 
 function Engine:elapsed_ms()
-  if self.start_time == 0 then
+  if not self.start_time then
     return 0
   end
-  local end_time = self.streaming and now_ms() or self.end_time
+  local end_time = self.streaming and now_ms() or (self.end_time or now_ms())
   return math.max(end_time - self.start_time - self.paused_ms, 0)
 end
 
 function Engine:ttft_ms()
-  if self.ttft_start == 0 or self.ttft_end == 0 then
+  if not self.ttft_start or not self.ttft_end then
     return 0
   end
   return math.max(self.ttft_end - self.ttft_start, 0)
 end
 
 function Engine:turn_elapsed_ms()
-  if self.turn_start == 0 then
+  if not self.turn_start then
     return 0
   end
-  local end_time = self.streaming and now_ms() or self.end_time
-  return math.max(end_time - self.turn_start - self.paused_ms, 0)
+  if self.streaming then
+    return math.max(now_ms() - self.turn_start - self.paused_ms, 0)
+  end
+  local end_time = self.end_time or now_ms()
+  return math.max(end_time - self.turn_start - self.tool_ms, 0)
 end
 
 function Engine:avg_tps()
+  -- No TurnStart means no elapsed time to divide by; a reconciled token
+  -- count alone would read as an absurd rate.
+  if not self.turn_start then
+    return 0
+  end
   -- A one-chunk answer can finish in under a millisecond; the 0.5s floor
   -- keeps a two-token reply from reading thousands of tok/s.
   local secs = math.max(self:turn_elapsed_ms() / 1000, 0.5)
@@ -362,9 +386,16 @@ end
 
 function Engine:value()
   if self.streaming then
+    -- A stock Maki starts the stream on ToolStart but never sends a delta, so
+    -- keep the last measured figure instead of flashing 0.0 tok/s.
+    if not self.saw_delta then
+      return self.displayed
+    end
     return self.tps
   end
-  if self.cfg.endTpsBehavior == "last" then
+  -- Without delta events there is no live rate to keep; fall back to the
+  -- turn average instead of showing a stale zero.
+  if self.cfg.endTpsBehavior == "last" and self.saw_delta then
     return self.tps
   end
   return self:avg_tps()
@@ -441,6 +472,7 @@ local function render(engine, force)
   last_render = now
 
   local tps = engine:value()
+  engine.displayed = tps
   local spans = {
     { string.format(" %.1f tok/s", tps), "dim" },
   }
@@ -508,7 +540,8 @@ maki.api.create_autocmd("TurnStart", {
     session_id = ev.data and ev.data.session_id
     refresh_config()
     engine:reset(engine.cfg, engine.provider)
-    render(engine, true)
+    -- No render here: the previous turn's figure stays on screen until the
+    -- first delta (live build) or TurnEnd (stock build) replaces it.
   end,
 })
 
@@ -528,6 +561,18 @@ maki.api.create_autocmd("ToolStart", {
     end
     engine:pause()
     render(engine, true)
+  end,
+})
+
+maki.api.create_autocmd("ToolDone", {
+  callback = function(ev)
+    local data = ev.data
+    if not data or data.session_id ~= session_id then
+      return
+    end
+    if data.duration_ms then
+      engine.tool_ms = engine.tool_ms + data.duration_ms
+    end
   end,
 })
 

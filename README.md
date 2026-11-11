@@ -121,10 +121,19 @@ Each row shows the percentage used and when it resets. The modal also keeps
 Maki's own session totals and per-model breakdown.
 
 `lua/tps.lua` reports the last turn's output speed (`42.3 tok/s`) in the hint
-line under the chat input. There is no per-stream hook for plugins, so it
-measures `TurnStart` → `TurnEnd` wall time minus the time tools ran
-(`ToolDone.duration_ms`): generation plus network/queueing. `os.time()` has
-one-second resolution, so very short turns read rough.
+line under the chat input. It adapts to the Maki build it runs on:
+
+- On a build that fires the `TextDelta`, `ThinkingDelta` and `ToolCallDelta`
+  autocmds and exposes `maki.uv.hrtime`, it shows a live rate while the model
+  streams, pauses during tools, and reconciles the exact figure from
+  `TurnEnd.usage.output_tokens`.
+- On a stock build (Maki 0.6.5 as released), those events and `hrtime` do not
+  exist. It falls back to `TurnStart` → `TurnEnd` wall time minus the time
+  tools ran (`ToolDone.duration_ms`): generation plus network/queueing.
+  `os.time()` has one-second resolution, so very short turns read rough.
+
+Installing `maki-config` on a fresh Maki therefore works without patching the
+core; the live mode lights up automatically when the core provides it.
 
 ## Auto-compaction
 
