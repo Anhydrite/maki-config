@@ -451,6 +451,16 @@ synchronous commands; use `bg_run` when the command may outlive a normal tool ca
   permission = "run",
   permission_scopes = "command",
   handler = function(input, ctx)
+    -- R1 (audit du 2026-11-11) : le mode handoff garde aussi les commandes de
+    -- fond. Sans cet appel, `bg_run` était une porte ouverte sur la suite
+    -- complète (mesuré : `bg_run("bash tests/run-impacted.sh")`).
+    local okH, handoff = pcall(require, "handoff")
+    if okH and type(handoff) == "table" and type(handoff.gate) == "function" then
+      local refus = handoff.gate(input and input.command)
+      if refus then
+        return { llm_output = refus, is_error = true }
+      end
+    end
     local rec, err = start_job(input)
     if not rec then
       return { llm_output = "error: " .. tostring(err), is_error = true }
