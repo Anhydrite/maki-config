@@ -80,8 +80,26 @@ local DONE_STEMS = { "fait", "termin", "livr", "publi", "sold", "done", "ok" }
 -- au propriétaire dès que la ligne attend de lui quelque chose — un arbitrage ou un geste.
 local ACT_STEMS = { "publication", "proprietaire", "propriétaire", "acte" }
 
+-- LUA NE SAIT PAS METTRE EN MINUSCULES UNE LETTRE ACCENTUEE. Mesure du 2026-11-10 :
+-- `string.lower` est OCTET par OCTET et ne connait que l'ASCII, donc « DÉCISION » (É = C3 89)
+-- restait « DÉCISION » et ne correspondait jamais a « décision » (é = C3 A9). Deux lignes dont la
+-- decision etait rendue en capitales restaient donc injoignables, alors que le meme mot en
+-- minuscules passait. On abaisse donc les capitales accentuees une par une, avant toute recherche.
+local MINUSCULES = {
+  { "É", "é" }, { "È", "è" }, { "Ê", "ê" }, { "À", "à" }, { "Â", "â" }, { "Ç", "ç" },
+  { "Î", "î" }, { "Ï", "ï" }, { "Ô", "ô" }, { "Ù", "ù" }, { "Û", "û" }, { "Œ", "œ" },
+}
+
+local function minuscules(texte)
+  local r = tostring(texte or ""):lower()
+  for _, paire in ipairs(MINUSCULES) do
+    r = r:gsub(paire[1], paire[2])
+  end
+  return r
+end
+
 local function is_blocked(state)
-  local s = (state or ""):lower()
+  local s = minuscules(state)
 
   -- 1. UNE DECISION BLOQUE, MEME SANS LE MOT « ATTENTE ». Mesure du 2026-10-30 :
   --    `**À FAIRE — décision de fonctionnalité**` n'etait pas vue comme bloquee, parce que le
@@ -90,21 +108,62 @@ local function is_blocked(state)
   -- Une decision DEJA RENDUE n'est plus un blocage : elle devient du travail. Mesure du 2026-10-30,
   -- apres la reponse du proprietaire (`REQ-20261030-09` : « décision rendue (b) : ignorer le
   -- parametre ») — sans cette exception, la relance aurait pose une question deja repondue.
-  local rendue = s:find("décision rendue", 1, true) or s:find("decision rendue", 1, true)
-    or s:find("décision prise", 1, true) or s:find("decision prise", 1, true)
+  -- MESURE DU 2026-11-10 (AnhyWhere, question du proprietaire « pourquoi la relance ne repart-elle
+  -- pas alors que 17 lignes sont ouvertes ») : TROIS DEFAUTS DE CE DETECTEUR, mesures en rejouant
+  -- le classement sur le registre.
+  --   (a) l'exception « decision rendue » exigeait la forme EXACTE et SINGULIERE : « DÉCISIONS DU
+  --       PROPRIÉTAIRE RENDUES » (pluriel, mots intercalés) etait comptee bloquee. Quatre lignes
+  --       dont la decision ETAIT rendue restaient donc injoignables ;
+  --   (b) « attente » etait cherche PARTOUT dans la cellule : un « EN ATTENTE » HISTORIQUE au milieu
+  --       d'une ligne devenue travaillable la bloquait a vie ;
+  --   (c) le mot « attendu » n'est pas « attente », donc une ligne en attente d'un GO passait pour
+  --       travaillable et etait reproposee a chaque tour.
+  -- CE QUI COMPTE DESORMAIS :
+  --   1. la TETE de la cellule dit « en attente » ;
+  --   2. une decision ou un arbitrage apparait et AUCUN n'est rendu ;
+  --   3. le travail restant n'appartient qu'a un acte du proprietaire (« ce qui reste » + un mot
+  --      d'acte : trois lignes measurent exactement cette forme).
+  local tete = s:gsub("^%s*%*+%s*", ""):gsub("^%s+", "")
+
+  local rendue = false
+  -- « DÉCISION DU PROPRIÉTAIRE, 2026-11-09 : « … » » est une decision RENDUE, meme sans le mot
+  -- « rendue » : la ligne cite la decision et sa date. Mesure du 2026-11-10 sur `REQ-20261109-21`
+  -- et `REQ-20261109-48`, injoignables autrement.
+  if s:find("décision du propriétaire", 1, true) or s:find("decision du proprietaire", 1, true)
+    or s:find("décisions du propriétaire", 1, true) then
+    rendue = true
+  end
+  if not rendue and (s:find("décision", 1, true) or s:find("decision", 1, true)) then
+    for _, mot in ipairs({ "rendue", "rendues", "rendu", "prise", "prises" }) do
+      if s:find(mot, 1, true) then
+        rendue = true
+        break
+      end
+    end
+  end
+
   if not rendue
     and (s:find("décision", 1, true) or s:find("decision", 1, true) or s:find("arbitrage", 1, true)) then
     return true
   end
 
-  -- 2. UN ACTE D'EXPLOITATION BLOQUE COMME UNE DECISION, mais seulement sous « attente » — sinon le
-  --    mot « acte » d'une demande ordinaire ferait passer une ligne travaillable pour bloquee.
-  if not s:find("attente", 1, true) then
-    return false
+  -- 2. LA TETE SEULE PORTE « EN ATTENTE ». Cherche partout, le mot bloquait une ligne dont
+  --    l'historique gardait une attente levee depuis longtemps.
+  if tete:sub(1, 10) == "en attente" then
+    return true
   end
-  for _, mot in ipairs(ACT_STEMS) do
-    if s:find(mot, 1, true) then
-      return true
+
+  -- 3. UN ACTE D'EXPLOITATION BLOQUE COMME UNE DECISION, mais seulement quand la ligne DIT que
+  --    c'est ce qui reste : sinon le mot « acte » d'une demande ordinaire ferait passer une ligne
+  --    travaillable pour bloquee.
+  -- Une decision RENDUE leve cette regle : « il reste X » decrivait l'etat d'avant la reponse, et
+  -- la ligne le dit encore. Mesure du 2026-11-10 : six lignes dont le proprietaire avait tranche
+  -- restaient bloquees par leur propre historique.
+  if not rendue and s:find("ce qui reste", 1, true) then
+    for _, mot in ipairs(ACT_STEMS) do
+      if s:find(mot, 1, true) then
+        return true
+      end
     end
   end
   return false
@@ -183,7 +242,17 @@ local function write_state_file()
   local saved = {}
   for id, st in pairs(sessions) do
     if st.armed then
-      saved[id] = { armed = true, max = st.max or 0, path = st.path, runs = st.runs or 0 }
+      -- `strikes` et `last_sig` sont ecrits aussi : sans eux, le fichier d'etat annoncait
+      -- `runs: 0` apres quatre relances (mesure du 2026-11-10) et le diagnostic commencait par
+      -- croire la boucle arretee.
+      saved[id] = {
+        armed = true,
+        max = st.max or 0,
+        path = st.path,
+        runs = st.runs or 0,
+        strikes = st.strikes or 0,
+        last_sig = st.last_sig,
+      }
     end
   end
   local encoded = maki.json.encode({ version = STATE_VERSION, sessions = saved })
@@ -528,12 +597,28 @@ local function cap_label(st)
   return "sans plafond"
 end
 
+-- MESURE DU 2026-11-11 (AnhyWhere, question du proprietaire « pourquoi /relance ne te relance
+-- pas tout seul ») : cette coupe se faisait a `longueur - 1` OCTETS, donc au milieu d'un
+-- caractere accentue. La note de relance portait alors un octet de continuation isole, et
+-- `maki.session.prompt` la REFUSAIT — `bad argument #1: error converting Lua string to String
+-- (invalid utf-8 sequence of 1 bytes from index 402)` — apres que l'armement avait ete ecrit.
+-- Resultat : boucle « armee » (state.json armed=true, runs=0) qui ne postait plus jamais un
+-- tour. On coupe sur une frontiere de CARACTERE : tant que l'octet suivant la coupe est une
+-- continuation (10xxxxxx), on recule.
 local function tronque(texte, longueur)
   local t = (texte or ""):gsub("%s+", " ")
   if #t <= longueur then
     return t
   end
-  return t:sub(1, longueur - 1) .. "…"
+  local coupe = longueur - 1
+  while coupe > 0 do
+    local suivant = t:byte(coupe + 1)
+    if not suivant or suivant < 0x80 or suivant >= 0xC0 then
+      break
+    end
+    coupe = coupe - 1
+  end
+  return t:sub(1, coupe) .. "…"
 end
 
 -- LA FORME « QUESTIONS ». Elle s'emploie quand AUCUNE ligne n'est traitable : demander le travail
@@ -767,6 +852,7 @@ step = function(session_id, kick, reason_from_turn)
   -- dix-huit relances.
   write_state_file()
 
+  write_state_file()
   log.info(string.format(
     "relance: run %d/%s for %s (%d unfinished, %d/%d done) %s",
     st.runs, cap_label(st), session_id, #unfinished, done, total, sent
@@ -1055,6 +1141,10 @@ return {
   parse = parse,
   is_done = is_done,
   _test = {
+    -- Surface de sonde de `tests/relance-note-utf8.sh` : la note de relance partait
+    -- avec un octet isole (2026-11-11), et `maki.session.prompt` la refusait.
+    tronque = tronque,
+    resume_note = resume_note,
     state_for = state_for,
     schedule_retry = schedule_retry,
     retry_policy = function() return MAX_OCCUPIED_RETRIES, RETRY_DELAY_MS, SLOW_RETRY_DELAY_MS end,
