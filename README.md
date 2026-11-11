@@ -10,6 +10,7 @@ rules, and Lua plugins. Clone it on a new machine and you get everything back.
 | `init.lua` | Settings (`always_yolo`) and plugin loading |
 | `permissions.toml` | Bash/shell permission rules |
 | `plugin.toml` | Permissions for the Lua files in this directory |
+| `pack-lock.json` | Pins the external `stress-test-user-feature` skill package |
 | `lua/relance.lua` | `/relance`: auto-relaunch driven by the project's `suivi.md` |
 | `lua/ocgo.lua` | `ocgo` provider: OpenCode Go + the DeepSeek V4 thinking-mode fix |
 | `lua/tps.lua` | Last-turn output speed (`tok/s`) under the chat input |
@@ -28,6 +29,7 @@ rules, and Lua plugins. Clone it on a new machine and you get everything back.
 | `commands/chrome-devtools-axi.md` | `/user:chrome-devtools-axi <tâche>` — invokes that skill |
 | `skills/lavish/SKILL.md` | `lavish` skill: HTML artifacts reviewed and annotated via `npx -y lavish-axi` |
 | `commands/lavish.md` | `/user:lavish <ce que l'artefact doit montrer>` — invokes that skill |
+| `commands/stress-test-user-feature.md` | `/user:stress-test-user-feature <feature>` — invokes the external skill |
 
 ## Install
 
@@ -374,6 +376,17 @@ adding or changing one.
 | --- | --- |
 | `chrome-devtools-axi` | `/user:chrome-devtools-axi <tâche>` |
 | `humanizer` | `/user:humanizer <texte>` |
+| `stress-test-user-feature` | `/user:stress-test-user-feature <feature>` |
+
+`stress-test-user-feature` is not vendored here. `init.lua` declares
+[`Anhydrite/stress-test-user-feature`](https://github.com/Anhydrite/stress-test-user-feature)
+as a Maki package, and a custom loader syncs its `SKILL.md` and `references/`
+into `skills/stress-test-user-feature/` at startup. The package asks for
+`fs_read` and `fs_write` on first install; approve it once. `pack-lock.json`
+pins the revision. The skill maps a feature, defines proof-of-use criteria,
+builds a test protocol, executes it, and reports a verdict with evidence. It
+presents the report in the conversation only; it proposes permanent tests and
+fixes but does not modify code until the user explicitly agrees.
 
 ## Adding a customization
 
