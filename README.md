@@ -127,10 +127,15 @@ line under the chat input. It adapts to the Maki build it runs on:
   autocmds and exposes `maki.uv.hrtime`, it shows a live rate while the model
   streams, pauses during tools, and reconciles the exact figure from
   `TurnEnd.usage.output_tokens`.
-- On a stock build (Maki 0.6.5 as released), those events and `hrtime` do not
-  exist. It falls back to `TurnStart` → `TurnEnd` wall time minus the time
-  tools ran (`ToolDone.duration_ms`): generation plus network/queueing.
-  `os.time()` has one-second resolution, so very short turns read rough.
+- On a stock build (Maki 0.7.1 as released), those events and `hrtime` do not
+  exist. It polls `maki.session.read().usage.output_tokens` every 250 ms while
+  a turn runs, so a multi-round turn (tool calls included) keeps moving; the
+  provider only updates that count at round boundaries, so a single streaming
+  answer still lands on its figure at `TurnEnd`. The turn average is wall time
+  from `TurnStart` minus the time tools ran (`ToolDone.duration_ms`), and the
+  exact count is reconciled from `TurnEnd.usage.output_tokens`. `os.time()` has
+  one-second resolution, so very short turns read rough. Before a turn has
+  produced any token the hint stays empty rather than flashing `0.0 tok/s`.
 
 Installing `maki-config` on a fresh Maki therefore works without patching the
 core; the live mode lights up automatically when the core provides it.

@@ -386,17 +386,29 @@ end
 
 function Engine:value()
   if self.streaming then
-    -- A stock Maki starts the stream on ToolStart but never sends a delta, so
-    -- keep the last measured figure instead of flashing 0.0 tok/s.
-    if not self.saw_delta then
+    if self.saw_delta then
+      return self.tps
+    end
+    -- A stock Maki starts the stream on ToolStart but never sends a delta.
+    -- The poller still learns the round's token count from session.read, so
+    -- show the running average as soon as there is something to average.
+    if self.tokens > 0 then
+      return self:avg_tps()
+    end
+    -- Nothing measured yet: no previous figure, no figure. Returning nil
+    -- keeps the hint empty instead of flashing a misleading 0.0 tok/s.
+    if self.displayed > 0 then
       return self.displayed
     end
-    return self.tps
+    return nil
   end
   -- Without delta events there is no live rate to keep; fall back to the
   -- turn average instead of showing a stale zero.
   if self.cfg.endTpsBehavior == "last" and self.saw_delta then
     return self.tps
+  end
+  if self.tokens <= 0 then
+    return nil
   end
   return self:avg_tps()
 end
@@ -472,6 +484,9 @@ local function render(engine, force)
   last_render = now
 
   local tps = engine:value()
+  if tps == nil then
+    return
+  end
   engine.displayed = tps
   local spans = {
     { string.format(" %.1f tok/s", tps), "dim" },
@@ -526,9 +541,55 @@ local function refresh_config()
   engine.provider = provider
 end
 
+-- Stock Maki exposes no TextDelta/ThinkingDelta/ToolCallDelta autocmds, so the
+-- only live signal is the session's running token usage. session.read updates
+-- it at each round boundary; polling it keeps a multi-round turn moving
+-- instead of freezing on the previous figure until TurnEnd.
+local poll_task = nil
+local poll_generation = 0
+
+local function stop_poll()
+  poll_generation = poll_generation + 1
+  if poll_task then
+    poll_task:cancel()
+    poll_task = nil
+  end
+end
+
+local function start_poll()
+  if poll_task or not session_id then
+    return
+  end
+  poll_generation = poll_generation + 1
+  local generation = poll_generation
+  local sid = session_id
+  poll_task = maki.async.spawn(function()
+    local baseline = nil
+    while generation == poll_generation do
+      local snap = maki.session.read({ session = sid })
+      if not snap then
+        break
+      end
+      if snap.usage then
+        local total = snap.usage.output_tokens or 0
+        if not baseline then
+          baseline = total
+        end
+        local delta = total - baseline
+        -- A build that fires deltas is already more precise than this.
+        if not engine.saw_delta and delta > engine.tokens then
+          engine.tokens = delta
+          render(engine, true)
+        end
+      end
+      maki.async.sleep(250)
+    end
+  end)
+end
+
 local function on_delta(ev)
   local data = ev.data
-  if not data or data.session_id ~= session_id then
+  if not data or (session_id and data.session_id ~= session_id) then
     return
   end
   engine:record(data.text or "")
@@ -540,8 +601,10 @@ maki.api.create_autocmd("TurnStart", {
     session_id = ev.data and ev.data.session_id
     refresh_config()
     engine:reset(engine.cfg, engine.provider)
+    stop_poll()
+    start_poll()
     -- No render here: the previous turn's figure stays on screen until the
-    -- first delta (live build) or TurnEnd (stock build) replaces it.
+    -- first delta (live build), a polled round, or TurnEnd replaces it.
   end,
 })
 
@@ -552,7 +615,7 @@ maki.api.create_autocmd("ToolCallDelta", { callback = on_delta })
 maki.api.create_autocmd("ToolStart", {
   callback = function(ev)
     local data = ev.data
-    if not data or data.session_id ~= session_id then
+    if not data or (session_id and data.session_id ~= session_id) then
       return
     end
     if not engine.streaming then
@@ -567,7 +630,7 @@ maki.api.create_autocmd("ToolStart", {
 maki.api.create_autocmd("ToolDone", {
   callback = function(ev)
     local data = ev.data
-    if not data or data.session_id ~= session_id then
+    if not data or (session_id and data.session_id ~= session_id) then
       return
     end
     if data.duration_ms then
@@ -579,9 +642,13 @@ maki.api.create_autocmd("ToolDone", {
 maki.api.create_autocmd("TurnEnd", {
   callback = function(ev)
     local data = ev.data or {}
-    if data.session_id ~= session_id then
+    -- TurnStart only fires under the TUI. In `maki -p` the first event a
+    -- plugin sees is TurnEnd, so adopt its session instead of dropping it.
+    if session_id and data.session_id ~= session_id then
       return
     end
+    session_id = session_id or data.session_id
+    stop_poll()
     engine:stop()
     engine:reconcile(data.usage and data.usage.output_tokens or 0)
     render(engine, true)
@@ -590,6 +657,7 @@ maki.api.create_autocmd("TurnEnd", {
 
 maki.api.create_autocmd({ "TurnError", "SessionReset" }, {
   callback = function()
+    stop_poll()
     engine:stop()
     maki.ui.set_status_hint(nil)
   end,
